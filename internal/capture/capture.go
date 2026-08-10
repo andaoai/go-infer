@@ -1,42 +1,46 @@
-// Package capture 在服务推理链路上按策略把"原图 + 预测伪标签"落盘成 YOLO 数据集。
+// Package capture 在服务推理链路上按策略把"原图 + 预测伪标签"落盘成数据集。
 //
-// 采集池按 <engine>/<YYYYMMDD>/{images,labels} 分组，按天分目录、按模型隔离。
+// 采集池按 <engine>/<YYYYMMDD>/images|labels 分组，按天分目录、按模型隔离。
 // 写入是异步的（不阻塞推理响应），并受总字节配额管控：超出配额时按文件 mtime
-// 从最旧开始成对删除 image+label。标签直接用 YOLO 格式，采集池就是一个可被
-// X-AnyLabeling/Label Studio 打开、修正后回流训练的数据集。
+// 从最旧开始成对删除 image+label。落盘格式由注入的 format.Codec 决定（YOLO
+// 为首例），字节落到注入的 storage.Storage（本地 FS 为首例），二者均可替换。
 package capture
 
 import (
+	"bytes"
+	"context"
 	"fmt"
-	"io/fs"
 	"log"
 	"math/rand"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/andaoai/go-infer/internal/dataset"
+	"github.com/andaoai/go-infer/internal/data"
 	"github.com/andaoai/go-infer/internal/engine"
+	"github.com/andaoai/go-infer/internal/format"
+	"github.com/andaoai/go-infer/internal/storage"
 )
 
-// Sample 是一次待采集的推理结果（原始图片字节 + 预测）。
+// Sample 是一次待采集的推理结果（原始图片字节 + 引擎结果）。
 type Sample struct {
-	Engine     string
-	Task       engine.Task
-	Image      []byte // 原始上传字节，按原编码落盘
-	W, H       int
-	ImgExt     string // ".jpg"/".png"，空则按 ".jpg"
-	Detections []engine.Detection
-	Instances  []engine.Instance
+	Engine string
+	Image  []byte // 原始上传字节，按原编码落盘
+	W, H   int
+	ImgExt string // ".jpg"/".png"，空则按 ".jpg"
+	Result engine.Result
 }
 
 // Config 控制采集策略与存储。
 type Config struct {
-	// Dir 是采集池根目录，如 dataset/pool。
-	Dir string
+	// Store 是采集池字节存储（必填）。
+	Store storage.Storage
+	// Codec 决定标签编码与图片/标签 key 推导（必填）。
+	Codec format.Codec
+	// PoolRoot 是采集池在 Store 下的前缀，如 "pool"。
+	PoolRoot string
 	// Rate 是"普通样本"的采样概率（0~1）。无检测/低置信度样本不受此限，必存。
 	Rate float64
 	// LowConf 是低置信阈值：最高置信度低于它（且有检测）视为不确定样本，必存。
@@ -53,18 +57,18 @@ type Config struct {
 
 // Recorder 是异步采集器。零值不可用，用 New 构造。
 type Recorder struct {
-	cfg    Config
-	ch     chan Sample
-	wg     sync.WaitGroup
-	stop   chan struct{}
-	mu     sync.Mutex
-	size   int64 // 当前采集池总字节（启动时扫描，运行期增量维护）
-	inited bool
+	cfg  Config
+	ch   chan Sample
+	wg   sync.WaitGroup
+	stop chan struct{}
+
+	mu   sync.Mutex
+	size int64 // 当前采集池总字节（启动时扫描，运行期增量维护）
 }
 
-// New 创建采集器并启动后台 worker。Dir 为空返回 nil（表示不采集）。
+// New 创建采集器并启动后台 worker。Store/Codec 为空返回 nil（表示不采集）。
 func New(cfg Config) (*Recorder, error) {
-	if cfg.Dir == "" {
+	if cfg.Store == nil || cfg.Codec == nil {
 		return nil, nil
 	}
 	if cfg.Rate < 0 {
@@ -82,16 +86,17 @@ func New(cfg Config) (*Recorder, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
-		return nil, fmt.Errorf("创建采集目录 %s: %w", cfg.Dir, err)
+	ctx := context.Background()
+	size, err := scanSize(ctx, cfg.Store, cfg.PoolRoot)
+	if err != nil {
+		return nil, fmt.Errorf("扫描采集池 %s: %w", cfg.PoolRoot, err)
 	}
 	r := &Recorder{
 		cfg:  cfg,
 		ch:   make(chan Sample, cfg.Buffer),
 		stop: make(chan struct{}),
+		size: size,
 	}
-	r.size = r.scanSize()
-	r.inited = true
 	r.wg.Add(1)
 	go r.run()
 	return r, nil
@@ -108,7 +113,6 @@ func (r *Recorder) Record(s Sample) {
 	select {
 	case r.ch <- s:
 	default:
-		// 队列满：丢一个最旧的，给新样本腾位（优先保留近期数据）。
 		select {
 		case <-r.ch:
 		default:
@@ -135,7 +139,6 @@ func (r *Recorder) run() {
 	for {
 		select {
 		case <-r.stop:
-			// 排空队列中已入队的样本再退出。
 			for {
 				select {
 				case s := <-r.ch:
@@ -152,13 +155,11 @@ func (r *Recorder) run() {
 
 // shouldCapture 实现"默认按 Rate 采样 + 必存无检测 + 必存低置信度"。
 func (r *Recorder) shouldCapture(s Sample) bool {
-	maxConf := r.maxConfidence(s)
+	maxConf := maxConfidence(s.Result)
 	switch {
 	case maxConf < 0:
-		// 无任何检测：hard negative，必存。
 		return true
 	case maxConf < r.cfg.LowConf:
-		// 有检测但最高置信度很低：不确定样本，必存。
 		return true
 	default:
 		if r.cfg.Rate >= 1 {
@@ -174,64 +175,69 @@ func (r *Recorder) shouldCapture(s Sample) bool {
 	}
 }
 
-// maxConfidence 返回样本中最高置信度；无检测返回 -1。
-func (r *Recorder) maxConfidence(s Sample) float32 {
-	var best float32 = -1
-	for _, d := range s.Detections {
-		if d.Confidence > best {
-			best = d.Confidence
-		}
+// maxConfidence 返回结果中最高置信度；无检测返回 -1。
+func maxConfidence(r engine.Result) float32 {
+	if r == nil {
+		return -1
 	}
-	for _, ins := range s.Instances {
-		if ins.Confidence > best {
-			best = ins.Confidence
+	var best float32 = -1
+	switch v := r.(type) {
+	case *engine.DetectionResult:
+		for _, d := range v.Detections {
+			if d.Confidence > best {
+				best = d.Confidence
+			}
+		}
+	case *engine.SegmentationResult:
+		for _, ins := range v.Instances {
+			if ins.Confidence > best {
+				best = ins.Confidence
+			}
 		}
 	}
 	return best
 }
 
 func (r *Recorder) write(s Sample) {
-	if s.W <= 0 || s.H <= 0 || len(s.Image) == 0 || s.Engine == "" {
+	if s.W <= 0 || s.H <= 0 || len(s.Image) == 0 || s.Engine == "" || s.Result == nil {
 		return
 	}
+	ctx := context.Background()
+	objs, err := data.ObjectsFromResult(s.Result)
+	if err != nil {
+		log.Printf("capture: 结果转换失败 (%s): %v", s.Engine, err)
+		return
+	}
+	labelBytes, err := r.cfg.Codec.Encode(objs, s.W, s.H)
+	if err != nil {
+		log.Printf("capture: 标签编码失败 (%s): %v", s.Engine, err)
+		return
+	}
+
 	now := r.cfg.Now()
 	day := now.Format("20060102")
 	stamp := now.Format("150405")
 	suffix := r.randHex(4)
 	stem := fmt.Sprintf("%s_%s", stamp, suffix)
 	ext := strings.ToLower(s.ImgExt)
-	if ext != ".jpg" && ext != ".jpeg" && ext != ".png" {
+	if !r.cfg.Codec.IsImageKey("x" + ext) {
 		ext = ".jpg"
 	}
+	imgKey := keyJoin(r.cfg.PoolRoot, sanitize(s.Engine), day, "images", stem+ext)
+	lblKey := r.cfg.Codec.LabelKey(imgKey)
 
-	base := filepath.Join(r.cfg.Dir, sanitize(s.Engine), day)
-	imgPath := filepath.Join(base, "images", stem+ext)
-	lblPath := filepath.Join(base, "labels", stem+".txt")
-
-	var labelErr error
-	switch s.Task {
-	case engine.TaskSegmentation:
-		labelErr = dataset.WriteSegLabel(lblPath, s.W, s.H, s.Instances)
-	default:
-		labelErr = dataset.WriteBoxLabel(lblPath, s.W, s.H, s.Detections)
-	}
-	if labelErr != nil {
-		log.Printf("capture: 写标签失败 %s: %v", lblPath, labelErr)
+	// 先写标签，再写图片；图片失败则回滚标签，避免孤儿标签。
+	if err := r.cfg.Store.Put(ctx, lblKey, bytes.NewReader(labelBytes)); err != nil {
+		log.Printf("capture: 写标签失败 %s: %v", lblKey, err)
 		return
 	}
-	if err := dataset.SaveImage(imgPath, s.Image); err != nil {
-		log.Printf("capture: 写图片失败 %s: %v", imgPath, err)
-		// 标签已写但图片失败，回滚标签，避免出现无图孤儿标签。
-		_ = os.Remove(lblPath)
+	if err := r.cfg.Store.Put(ctx, imgKey, bytes.NewReader(s.Image)); err != nil {
+		log.Printf("capture: 写图片失败 %s: %v", imgKey, err)
+		_ = r.cfg.Store.Remove(ctx, lblKey)
 		return
 	}
 
-	// 图片 + 标签都计入配额，保证淘汰准确。
-	added := int64(len(s.Image))
-	if fi, err := os.Stat(lblPath); err == nil {
-		added += fi.Size()
-	}
-	r.addSize(added)
+	r.addSize(int64(len(s.Image)) + int64(len(labelBytes)))
 	r.enforceQuota()
 }
 
@@ -245,111 +251,64 @@ func (r *Recorder) enforceQuota() {
 	if r.size <= r.cfg.QuotaBytes {
 		return
 	}
-	files := r.listFiles()
-	sort.Slice(files, func(i, j int) bool { return files[i].mod.Before(files[j].mod) })
+	ctx := context.Background()
+	infos, err := r.cfg.Store.List(ctx, r.cfg.PoolRoot)
+	if err != nil {
+		log.Printf("capture: 枚举采集池失败: %v", err)
+		return
+	}
+	files := make([]storage.Info, 0, len(infos))
+	for _, in := range infos {
+		if !in.IsDir {
+			files = append(files, in)
+		}
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].ModTime.Before(files[j].ModTime) })
 	for _, f := range files {
 		if r.size <= r.cfg.QuotaBytes {
 			break
 		}
-		sz := f.size
-		if err := os.Remove(f.path); err != nil {
-			if !os.IsNotExist(err) {
-				log.Printf("capture: 删除失败 %s: %v", f.path, err)
-			}
+		if err := r.cfg.Store.Remove(ctx, f.Key); err != nil {
+			log.Printf("capture: 删除失败 %s: %v", f.Key, err)
 			continue
 		}
-		r.size -= sz
-		// 若是图片，顺带删除同名标签；若是标签，顺带删除同名图片。
-		peer := peerPath(f.path)
-		if fi, err := os.Stat(peer); err == nil {
-			if rmErr := os.Remove(peer); rmErr == nil {
-				r.size -= fi.Size()
+		r.size -= f.Size
+		// 图片连带删同名标签，标签连带删同名图片。
+		var peer string
+		if r.cfg.Codec.IsImageKey(f.Key) {
+			peer = r.cfg.Codec.LabelKey(f.Key)
+		} else {
+			peer = "" // 非图片不反推（格式自定），由图片删除时连带处理
+		}
+		if peer != "" {
+			if pi, err := r.cfg.Store.Stat(ctx, peer); err == nil {
+				if r.cfg.Store.Remove(ctx, peer) == nil {
+					r.size -= pi.Size
+				}
 			}
 		}
 	}
-	r.cleanEmptyDirs()
 }
 
-type fileEntry struct {
-	path string
-	size int64
-	mod  time.Time
-}
-
-// listFiles 列出采集池下所有普通文件。
-func (r *Recorder) listFiles() []fileEntry {
-	var out []fileEntry
-	_ = filepath.WalkDir(r.cfg.Dir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil
-		}
-		fi, err := d.Info()
-		if err != nil {
-			return nil
-		}
-		out = append(out, fileEntry{path: p, size: fi.Size(), mod: fi.ModTime()})
-		return nil
-	})
-	return out
-}
-
-// scanSize 启动时统计采集池现有总字节。
-func (r *Recorder) scanSize() int64 {
+// scanSize 统计存储中采集池现有总字节。
+func scanSize(ctx context.Context, st storage.Storage, root string) (int64, error) {
+	infos, err := st.List(ctx, root)
+	if err != nil {
+		return 0, err
+	}
 	var total int64
-	_ = filepath.WalkDir(r.cfg.Dir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil
+	for _, in := range infos {
+		if !in.IsDir {
+			total += in.Size
 		}
-		fi, err := d.Info()
-		if err == nil {
-			total += fi.Size()
-		}
-		return nil
-	})
-	return total
+	}
+	return total, nil
 }
 
 func (r *Recorder) addSize(n int64) {
 	r.mu.Lock()
 	r.size += n
 	r.mu.Unlock()
-}
-
-// cleanEmptyDirs 删除池内空的 images/labels/天/模型目录（配额淘汰后收尾）。
-func (r *Recorder) cleanEmptyDirs() {
-	_ = filepath.WalkDir(r.cfg.Dir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || !d.IsDir() || p == r.cfg.Dir {
-			return nil
-		}
-		entries, e := os.ReadDir(p)
-		if e == nil && len(entries) == 0 {
-			_ = os.Remove(p)
-		}
-		return nil
-	})
-}
-
-// peerPath 返回与某文件同名、位于兄弟 images/labels 目录的对应文件路径。
-func peerPath(path string) string {
-	dir, file := filepath.Split(path)
-	parent := filepath.Dir(filepath.Clean(dir))
-	base := filepath.Base(filepath.Clean(dir))
-	stem := strings.TrimSuffix(file, filepath.Ext(file))
-	var peerDir string
-	switch base {
-	case "images":
-		peerDir = filepath.Join(parent, "labels")
-	case "labels":
-		peerDir = filepath.Join(parent, "images")
-	default:
-		return ""
-	}
-	// 在 peer 目录里找任意匹配 stem 的扩展名。
-	matches, err := filepath.Glob(filepath.Join(peerDir, stem+".*"))
-	if err != nil || len(matches) == 0 {
-		return ""
-	}
-	return matches[0]
 }
 
 func (r *Recorder) randHex(n int) string {
@@ -367,11 +326,21 @@ func (r *Recorder) randHex(n int) string {
 	return string(b)
 }
 
+// keyJoin 用正斜杠拼接存储 key（存储无关的逻辑路径）。
+func keyJoin(parts ...string) string {
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, filepath.ToSlash(p))
+		}
+	}
+	return strings.Join(out, "/")
+}
+
 // sanitize 把引擎名里的路径分隔符/特殊字符替换掉，避免越出采集根目录。
 func sanitize(name string) string {
 	name = strings.TrimSpace(name)
 	name = strings.ReplaceAll(name, "..", "_")
-	name = strings.ReplaceAll(name, string(os.PathSeparator), "_")
 	name = strings.ReplaceAll(name, "/", "_")
 	name = strings.ReplaceAll(name, "\\", "_")
 	if name == "" {

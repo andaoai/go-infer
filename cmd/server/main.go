@@ -19,7 +19,9 @@ import (
 	"github.com/andaoai/go-infer/internal/engine"
 	"github.com/andaoai/go-infer/internal/engines/onnxruntime/detect"
 	"github.com/andaoai/go-infer/internal/engines/onnxruntime/seg"
+	"github.com/andaoai/go-infer/internal/format/yolo"
 	"github.com/andaoai/go-infer/internal/ortenv"
+	"github.com/andaoai/go-infer/internal/storage/local"
 	ort "github.com/yalue/onnxruntime_go"
 )
 
@@ -40,7 +42,8 @@ func main() {
 		addr        = flag.String("addr", ":8080", "监听地址")
 		ortLib      = flag.String("ort-lib", "", "libonnxruntime.so 路径；留空则自动查找")
 
-		captureDir    = flag.String("capture-dir", "", "推理采集池根目录（如 dataset/pool）；留空则不采集")
+		captureDir    = flag.String("capture-dir", "", "推理采集池根目录（本地目录，如 dataset）；留空则不采集")
+		capturePool   = flag.String("capture-pool", "", "采集池在 -capture-dir 下的前缀（默认空，直接落在 <dir>/<engine>/<date>）")
 		captureRate   = flag.Float64("capture-rate", 0.1, "普通样本采样概率 0~1；无检测/低置信度样本必存")
 		captureLow    = flag.Float64("capture-low-conf", 0.25, "最高置信度低于该值的不确定样本必存")
 		captureQuota  = flag.String("capture-quota", "5GB", "采集池总容量上限（如 500MB/5GB/0 表示不限）")
@@ -91,13 +94,13 @@ func main() {
 	// 在此 srv.Register(...) 更多引擎（TensorRT/NCNN/llama.cpp ...）。
 
 	// 推理采集（原图 + YOLO 伪标签），默认关闭。
-	if rec, err := newCaptureRecorder(*captureDir, *captureRate, float32(*captureLow), *captureQuota, *captureBuffer); err != nil {
+	if rec, err := newCaptureRecorder(*captureDir, *capturePool, *captureRate, float32(*captureLow), *captureQuota, *captureBuffer); err != nil {
 		log.Fatalf("初始化采集器: %v", err)
 	} else if rec != nil {
 		srv.SetRecorder(recAdapter{rec})
 		defer rec.Close()
-		log.Printf("推理采集已开启: dir=%s rate=%.2f low-conf=%.2f quota=%s",
-			*captureDir, *captureRate, *captureLow, *captureQuota)
+		log.Printf("推理采集已开启: dir=%s pool=%s rate=%.2f low-conf=%.2f quota=%s",
+			*captureDir, *capturePool, *captureRate, *captureLow, *captureQuota)
 	}
 
 	log.Printf("go-infer 服务启动于 %s | 默认引擎=%s task=%s framework=%s classes=%d",
@@ -135,16 +138,22 @@ var (
 )
 
 // newCaptureRecorder 构造采集器；dir 为空返回 nil 表示不采集。
-func newCaptureRecorder(dir string, rate float64, lowConf float32, quota string, buffer int) (*capture.Recorder, error) {
+func newCaptureRecorder(dir, poolRoot string, rate float64, lowConf float32, quota string, buffer int) (*capture.Recorder, error) {
 	if dir == "" {
 		return nil, nil
+	}
+	st, err := local.New(dir)
+	if err != nil {
+		return nil, err
 	}
 	quotaBytes, err := parseSize(quota)
 	if err != nil {
 		return nil, err
 	}
 	return capture.New(capture.Config{
-		Dir:        dir,
+		Store:      st,
+		Codec:      yolo.New(),
+		PoolRoot:   poolRoot,
 		Rate:       rate,
 		LowConf:    lowConf,
 		QuotaBytes: quotaBytes,
@@ -152,19 +161,17 @@ func newCaptureRecorder(dir string, rate float64, lowConf float32, quota string,
 	})
 }
 
-// recAdapter 把 api.CaptureSample 转成 capture.Sample。
+// recAdapter 把 api.CaptureSample 透传成 capture.Sample。
 type recAdapter struct{ r *capture.Recorder }
 
 func (a recAdapter) Record(s api.CaptureSample) {
 	a.r.Record(capture.Sample{
-		Engine:     s.Engine,
-		Task:       s.Task,
-		Image:      s.Image,
-		W:          s.W,
-		H:          s.H,
-		ImgExt:     s.ImgExt,
-		Detections: s.Detections,
-		Instances:  s.Instances,
+		Engine: s.Engine,
+		Image:  s.Image,
+		W:      s.W,
+		H:      s.H,
+		ImgExt: s.ImgExt,
+		Result: s.Result,
 	})
 }
 

@@ -1,32 +1,28 @@
 package promote
 
 import (
-	"os"
-	"path/filepath"
+	"bytes"
+	"context"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/andaoai/go-infer/internal/format/yolo"
+	"github.com/andaoai/go-infer/internal/storage"
+	"github.com/andaoai/go-infer/internal/storage/local"
 )
 
-// seedPool 构造一个采集池：
-//
-//	<pool>/<eng>/<date>/images/<stem>.jpg
-//	<pool>/<eng>/<date>/labels/<stem>.txt （有标签时）
-func seedPool(t *testing.T, pool, eng, date, stem string, withLabel bool) {
+// seedPool 在 store 的 pool/<eng>/<date>/ 下种一张图（可选标签）。
+func seedPool(t *testing.T, st *local.Storage, pool, eng, date, stem string, withLabel bool) {
 	t.Helper()
-	imgDir := filepath.Join(pool, eng, date, "images")
-	lblDir := filepath.Join(pool, eng, date, "labels")
-	if err := os.MkdirAll(imgDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(imgDir, stem+".jpg"), []byte("img"), 0o644); err != nil {
+	ctx := context.Background()
+	imgKey := keyJoin(pool, eng, date, "images", stem+".jpg")
+	if err := st.Put(ctx, imgKey, bytes.NewReader([]byte("img"))); err != nil {
 		t.Fatal(err)
 	}
 	if withLabel {
-		if err := os.MkdirAll(lblDir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(lblDir, stem+".txt"), []byte("0 0.5 0.5 0.2 0.2\n"), 0o644); err != nil {
+		lblKey := keyJoin(pool, eng, date, "labels", stem+".txt")
+		if err := st.Put(ctx, lblKey, strings.NewReader("0 0.5 0.5 0.2 0.2\n")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -34,82 +30,95 @@ func seedPool(t *testing.T, pool, eng, date, stem string, withLabel bool) {
 
 func fixedNow() time.Time { return time.Date(2026, 8, 10, 15, 0, 0, 0, time.Local) }
 
-func TestPromoteMovesAndWritesYAML(t *testing.T) {
-	pool := t.TempDir()
+func newTestOpts(t *testing.T, move bool) (Options, *local.Storage) {
+	t.Helper()
 	root := t.TempDir()
-	seedPool(t, pool, "yolov8n", "20260810", "143052_ab", true)
-	seedPool(t, pool, "yolov8n", "20260810", "143100_cd", false) // hard negative，无标签
+	st, err := local.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Options{
+		Store: st, Codec: yolo.New(),
+		PoolRoot: "pool", DatasetRoot: "dataset",
+		ConfigRoot: st.Root(), // 绝对磁盘路径，写进 data.yaml 的 path
+		Move:       move, Classes: []string{"person"}, Now: fixedNow,
+	}, st
+}
 
-	res, err := Run(Options{
-		PoolDir: pool, DatasetRoot: root, Move: true,
-		Classes: []string{"person"}, Now: fixedNow,
-	})
+func countFiles(infos []storage.Info) int {
+	n := 0
+	for _, in := range infos {
+		if !in.IsDir {
+			n++
+		}
+	}
+	return n
+}
+
+func TestPromoteMovesAndWritesYAML(t *testing.T) {
+	opts, st := newTestOpts(t, true)
+	seedPool(t, st, "pool", "yolov8n", "20260810", "143052_ab", true)
+	seedPool(t, st, "pool", "yolov8n", "20260810", "143100_cd", false) // hard negative
+
+	res, err := Run(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res.Total != 2 {
 		t.Fatalf("want 2 promoted, got %d", res.Total)
 	}
-
-	// 目标位置应有两张图、两个标签（无标签样本生成空标签）。
-	imgDir := filepath.Join(root, "yolov8n", "images", "train")
-	lblDir := filepath.Join(root, "yolov8n", "labels", "train")
-	if imgs, _ := os.ReadDir(imgDir); len(imgs) != 2 {
-		t.Errorf("目标图片数 = %d, want 2", len(imgs))
+	ctx := context.Background()
+	imgs, _ := st.List(ctx, "dataset/yolov8n/images/train")
+	if n := countFiles(imgs); n != 2 {
+		t.Errorf("目标图片数 = %d, want 2", n)
 	}
-	if lbls, _ := os.ReadDir(lblDir); len(lbls) != 2 {
-		t.Errorf("目标标签数 = %d, want 2", len(lbls))
+	lbls, _ := st.List(ctx, "dataset/yolov8n/labels/train")
+	if n := countFiles(lbls); n != 2 {
+		t.Errorf("目标标签数 = %d, want 2", n)
 	}
-	// 移动后源目录应被清空。
-	if _, err := os.Stat(filepath.Join(pool, "yolov8n", "20260810")); !os.IsNotExist(err) {
-		t.Error("移动后源日期目录应被删除")
+	if left, _ := st.List(ctx, "pool/yolov8n/20260810"); len(left) != 0 {
+		t.Errorf("移动后源应清空，剩余 %d", len(left))
 	}
-
-	yaml, err := os.ReadFile(filepath.Join(root, "yolov8n", "data.yaml"))
+	rc, err := st.Get(ctx, "dataset/yolov8n/data.yaml")
 	if err != nil {
 		t.Fatalf("data.yaml 未生成: %v", err)
 	}
-	if !strings.Contains(string(yaml), "nc: 1") || !strings.Contains(string(yaml), "person") {
-		t.Errorf("data.yaml 内容异常:\n%s", yaml)
+	defer rc.Close()
+	buf := new(bytes.Buffer)
+	buf.ReadFrom(rc)
+	if !strings.Contains(buf.String(), "nc: 1") || !strings.Contains(buf.String(), "person") {
+		t.Errorf("data.yaml 内容异常:\n%s", buf.String())
 	}
-	if _, err := os.Stat(res.Manifest); err != nil {
+	if _, err := st.Stat(ctx, res.Manifest); err != nil {
 		t.Errorf("版本清单未生成: %v", err)
 	}
 }
 
 func TestPromoteCopyKeepsPool(t *testing.T) {
-	pool := t.TempDir()
-	root := t.TempDir()
-	seedPool(t, pool, "yolov8n-seg", "20260810", "a", true)
+	opts, st := newTestOpts(t, false)
+	seedPool(t, st, "pool", "yolov8n-seg", "20260810", "a", true)
 
-	res, err := Run(Options{
-		PoolDir: pool, DatasetRoot: root,
-		Classes: []string{"obj"}, Move: false, Now: fixedNow,
-	})
+	res, err := Run(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res.Total != 1 {
 		t.Fatalf("want 1, got %d", res.Total)
 	}
-	// 复制模式下源文件仍在。
-	if _, err := os.Stat(filepath.Join(pool, "yolov8n-seg", "20260810", "images", "a.jpg")); err != nil {
+	if _, err := st.Stat(context.Background(), "pool/yolov8n-seg/20260810/images/a.jpg"); err != nil {
 		t.Errorf("复制模式不应删除源文件: %v", err)
 	}
 }
 
 func TestPromoteFilterByEngineAndDate(t *testing.T) {
-	pool := t.TempDir()
-	root := t.TempDir()
-	seedPool(t, pool, "yolov8n", "20260810", "a", true)
-	seedPool(t, pool, "yolov8n-seg", "20260810", "b", true)
-	seedPool(t, pool, "yolov8n", "20260811", "c", true)
+	opts, st := newTestOpts(t, true)
+	seedPool(t, st, "pool", "yolov8n", "20260810", "a", true)
+	seedPool(t, st, "pool", "yolov8n-seg", "20260810", "b", true)
+	seedPool(t, st, "pool", "yolov8n", "20260811", "c", true)
 
-	res, err := Run(Options{
-		PoolDir: pool, DatasetRoot: root,
-		Engine: "yolov8n", Date: "20260810",
-		Classes: []string{"x"}, Now: fixedNow,
-	})
+	opts.Engine = "yolov8n"
+	opts.Date = "20260810"
+	res, err := Run(opts)
 	if err != nil {
 		t.Fatal(err)
 	}

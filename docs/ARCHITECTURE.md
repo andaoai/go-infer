@@ -6,7 +6,16 @@
 
 ## 一、整体分层架构
 
-引擎无关是第一原则：HTTP 层和调度层只依赖 `internal/engine` 的接口，不知道背后是 ONNX Runtime、TensorRT 还是 NCNN。加一个后端/算法只是新增一个 `Engine` 实现并注册。
+引擎无关是第一原则，但不是唯一原则。整套数据闭环沿**四条可插拔轴**设计，每一轴都由一个接口隔离，YOLO + ONNX Runtime + 本地文件系统只是首个示范组合：
+
+| 轴 | 含义 | 接缝接口 | 首个内置实现 |
+|----|------|----------|--------------|
+| **任务（算法）** | 检测 / 分割 / 分类 / 姿态 / 生成 | `engine.Task` + `engine.Result` 的具体类型 | detect、segmentation |
+| **后端（推理框架）** | ONNX Runtime / TensorRT / NCNN / llama.cpp | `engine.Engine` | `engines/onnxruntime/{detect,seg}` |
+| **存储（字节落地）** | 本地 FS / S3 / OSS / 内存 | `storage.Storage`（Put/Get/List/Stat/Remove） | `storage/local` |
+| **格式（标签编码）** | YOLO txt / COCO json / VOC xml | `format.Codec`（Encode/Decode/LabelKey/ListImages） | `format/yolo` |
+
+四轴在 `internal/data` 的**规范数据模型**（`data.Object`：ClassID/Confidence/BBox/Rings）处汇合：引擎结果经 `data.ObjectsFromResult` 唯一一处 type switch 转成 `[]Object`，采集、回流、指标全程只认 `Object`，不再出现第二套几何类型。加一种格式或存储后端只新增实现，不动闭环逻辑；加一种任务类型只在 `ObjectsFromResult` 加一个 case。
 
 ```mermaid
 flowchart TB
@@ -26,13 +35,15 @@ flowchart TB
         VIS["可视化 drawBoxes/drawInstances"]
     end
 
-    subgraph Core["internal（引擎无关核心）"]
+    subgraph Core["internal（引擎/存储/格式无关核心）"]
+        DATA["data<br/>Object/BBox/Point（规范模型）<br/>ObjectsFromResult"]
         ENG["engine<br/>Engine/Request/Result/Task"]
+        STOR["storage.Storage<br/>+ storage/local"]
+        FMT["format.Codec<br/>+ format/yolo"]
+        METRIC["metric<br/>IoU / 栅格化 / COCO AP·mAP"]
+        CAP["capture<br/>异步采集 + 配额淘汰（Store+Codec）"]
+        PROM["promote<br/>采集池合并 + 训练配置（Store+Codec）"]
         SCHED["sched（规划中）<br/>worker pool / dynamic batching"]
-        DS2["dataset<br/>YOLO 标签读写"]
-        EVAL["eval<br/>IoU / 栅格化 / COCO AP·mAP"]
-        CAP["capture<br/>异步采集 + 配额淘汰"]
-        PROM["promote<br/>采集池合并 + data.yaml"]
         PRE["preprocess<br/>letterbox / NCHW / NMS"]
         CFG["appcfg / ortenv<br/>类别名 / ORT 初始化"]
     end
@@ -49,15 +60,22 @@ flowchart TB
     ROUTE --> ENG
     ROUTE -.推理后异步入队.-> REC
     REC --> CAP
+    CAP --> STOR
+    CAP --> FMT
+    CAP --> DATA
     SRV --> API
     SRV --> Core
     SRV --> Backends
-    VAL --> EVAL
-    VAL --> DS2
+    VAL --> METRIC
+    VAL --> FMT
+    VAL --> STOR
     VAL --> Backends
     DS --> PROM
-    DS --> DS2
+    PROM --> STOR
+    PROM --> FMT
     API --> Core
+    FMT --> DATA
+    METRIC --> DATA
     SCHED -.-> ENG
     DET --> ORT
     SEG --> ORT
@@ -67,6 +85,7 @@ flowchart TB
     class SCHED,FUTURE planned;
 ```
 
+- **依赖方向无环**：`data`/`storage` 无内部依赖；`format` 与 `metric` 依赖 `data`(+`storage`)；`capture`/`promote` 依赖三者加 `engine`；`cmd/*` 负责把具体实现装配进去。
 - 当前并发模型：引擎内部 `runMu` 串行（共享张量），高并发/攒批能力在规划中的 `internal/sched`。
 - `cmd/validate` 与 `cmd/dataset` 是**纯离线工具**，不启动服务。
 
@@ -187,8 +206,8 @@ sequenceDiagram
         H-->>C: JSON 结果
         opt 采集已开启且命中策略
             H-)R: Record(sample)（异步，不阻塞响应）
-            R->>R: 判定策略 / 写标签 / 写图片
-            R->>FS: 存 image + YOLO label
+            R->>R: ObjectsFromResult → Codec.Encode
+            R->>FS: Storage.Put(image + label)
             R->>R: 配额检查与淘汰
         end
     end
@@ -196,7 +215,8 @@ sequenceDiagram
 
 关键点：
 - 采集只在 **JSON 响应路径**触发，`vis=1`（可视化查看）不采集，避免把调试点击算进数据。
-- 落盘的是**原始上传字节**，不重新编码；标签由 `internal/dataset` 的 Writer 归一化写出。
+- api 层不再按任务类型分支记录：把整个 `engine.Result` 丢给采集器，转换与编码在 `data.ObjectsFromResult` + `Codec` 内完成。
+- 落盘的是**原始上传字节**，不重新编码；标签字节由注入的 `format.Codec` 归一化写出，落到注入的 `storage.Storage`。
 
 ---
 
@@ -205,15 +225,15 @@ sequenceDiagram
 ```mermaid
 flowchart LR
     subgraph Validate["cmd/validate（发版门禁）"]
-        V1["dataset.Load<br/>读 test 图片+标签"]
-        V2["Engine.Run<br/>逐张推理"]
-        V3["eval.AP / MAPOverThresholds<br/>框/掩膜 mAP"]
+        V1["Codec.ListImages<br/>+ Storage.Get 读图片/标签"]
+        V2["Engine.Run 逐张推理<br/>ObjectsFromResult"]
+        V3["metric.AP / MAPOverThresholds<br/>框/掩膜 mAP"]
         V1 --> V2 --> V3
     end
     subgraph Dataset["cmd/dataset promote（回流）"]
-        D1["扫描 pool/&lt;engine&gt;/&lt;date&gt;"]
-        D2["移动/复制 到 dataset/&lt;engine&gt;/train"]
-        D3["写 data.yaml"]
+        D1["Storage.List 扫描 pool<br/>Codec.LabelKey 找标签"]
+        D2["Get→Put（→Remove） 搬到 dataset/&lt;engine&gt;/train"]
+        D3["Codec(DatasetConfigWriter).<br/>WriteDatasetConfig 写 data.yaml"]
         D4["写 versions/*.json"]
         D1 --> D2 --> D3 --> D4
     end
@@ -225,23 +245,25 @@ flowchart LR
 
 | 目录 | 职责 |
 |------|------|
-| `cmd/server` | HTTP 服务入口：加载 ORT、注册引擎、挂采集器 |
+| `cmd/server` | HTTP 服务入口：加载 ORT、注册引擎、装配 storage/codec、挂采集器 |
 | `cmd/validate` | 数据集 mAP 校验（发版门禁） |
 | `cmd/dataset` | 采集池回流（promote） |
-| `internal/engine` | 引擎无关抽象：`Engine`/`Request`/`Result`/`Task` |
+| `internal/data` | 规范数据模型 `Object`/`BBox`/`Point`，唯一的结果类型转换 `ObjectsFromResult` |
+| `internal/engine` | 后端轴抽象：`Engine`/`Request`/`Result`/`Task` |
+| `internal/storage` | 存储轴：`Storage` 接口 + `local` 实现 |
+| `internal/format` | 格式轴：`Codec` 接口 + `yolo` 实现（含 `DatasetConfigWriter`） |
+| `internal/metric` | IoU、多边形栅格化、COCO AP/mAP，消费 `data.Object` |
 | `internal/api` | HTTP/SSE、可视化、`Recorder` 钩子 |
-| `internal/dataset` | YOLO 标签读取与写入 |
-| `internal/eval` | IoU、多边形栅格化、COCO AP/mAP |
-| `internal/capture` | 异步推理采集 + 策略 + 配额淘汰 |
-| `internal/promote` | 采集池合并、`data.yaml`、版本清单 |
+| `internal/capture` | 异步推理采集 + 策略 + 配额淘汰（依赖 Storage + Codec） |
+| `internal/promote` | 采集池合并、训练配置、版本清单（依赖 Storage + Codec） |
 | `internal/preprocess` | letterbox / NCHW / NMS |
 | `internal/appcfg`、`internal/ortenv` | 类别名与 ORT 初始化（多入口共用） |
 | `internal/engines/<框架>/<任务>` | 具体引擎实现（当前 ONNX Runtime detect/seg） |
 
 ### 关键设计约束
 
-- **引擎无关**：上层只认 `engine.Engine`，新后端实现接口即可，不动 HTTP/采集/校验。
-- **数据格式统一**：采集池、训练集、校验集全部是 YOLO 目录结构，`dataset`/`eval` 复用同一套读写。
+- **四轴可插拔**：任务（`engine.Result` 类型）、后端（`engine.Engine`）、存储（`storage.Storage`）、格式（`format.Codec`）。换后端/存储/格式只新增实现，不动闭环逻辑；当前只各内置一个示范实现，不投机堆第二个。
+- **单一规范模型**：`engine.Detection`、`dataset.GT`、`eval.Box` 三套几何已合并为 `data.Object`；`ObjectsFromResult` 是全仓唯一对具体结果类型做 type switch 的地方。
 - **采集默认关闭**：必须显式 `-capture-dir` 才落盘，避免意外数据留存。
-- **数据不入库**：`dataset/`、`testdata/`、`third_party/`、模型与 `.so` 全部 gitignored。
+- **数据不入库**：`dataset/`、`testdata/`、`third_party/`、模型与 `.so` 全部 gitignored（`models/yolov8n*.onnx` 作为官方样例权重除外）。
 - **部署形态**：当前 ORT 引擎依赖动态库（非纯静态）；纯 Go/端侧后端是后续方向。

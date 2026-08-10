@@ -1,7 +1,8 @@
 // Command validate 在带标注的数据集上校验检测/分割模型，输出 mAP。
 //
-// 读取 YOLO 格式数据集（图片 + 标签，支持检测 5 列和分割多边形），分别用
-// 检测引擎和分割引擎跑推理，计算：
+// 通过注入的 format.Codec 读取标签（首个内置实现为 YOLO），通过注入的
+// storage.Storage 读取字节（首个内置实现为本地 FS），用引擎跑推理后把结果
+// 统一成 data.Object，交给引擎/格式无关的 metric 包评分。分别计算：
 //   - 检测模型：box mAP@.5 / mAP@.50:.95
 //   - 分割模型：box mAP@.5 / mAP@.50:.95、mask mAP@.5 / mAP@.50:.95
 //
@@ -9,22 +10,28 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
 	"image"
+	_ "image/jpeg"
+	_ "image/png"
 	"log"
 	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
 	"github.com/andaoai/go-infer/internal/appcfg"
-	"github.com/andaoai/go-infer/internal/dataset"
+	"github.com/andaoai/go-infer/internal/data"
 	"github.com/andaoai/go-infer/internal/engine"
 	"github.com/andaoai/go-infer/internal/engines/onnxruntime/detect"
 	"github.com/andaoai/go-infer/internal/engines/onnxruntime/seg"
-	"github.com/andaoai/go-infer/internal/eval"
+	"github.com/andaoai/go-infer/internal/format/yolo"
+	"github.com/andaoai/go-infer/internal/metric"
 	"github.com/andaoai/go-infer/internal/ortenv"
+	"github.com/andaoai/go-infer/internal/storage/local"
 	ort "github.com/yalue/onnxruntime_go"
 )
 
@@ -56,31 +63,45 @@ func main() {
 		log.Fatalf("读取类别: %v", err)
 	}
 
-	samples, err := dataset.Load(*dataDir, *split)
+	// 数据集根所在的目录作为本地存储根，数据集根作为相对前缀。
+	storeRoot := filepath.Dir(filepath.Clean(*dataDir))
+	dsPrefix := filepath.Base(filepath.Clean(*dataDir))
+	st, err := local.New(storeRoot)
 	if err != nil {
-		log.Fatalf("加载数据集: %v", err)
+		log.Fatalf("打开存储 %s: %v", storeRoot, err)
 	}
-	if *limit > 0 && *limit < len(samples) {
-		samples = samples[:*limit]
+	codec := yolo.New()
+	ctx := context.Background()
+
+	refs, err := codec.ListImages(ctx, st, dsPrefix, *split)
+	if err != nil {
+		log.Fatalf("枚举数据集: %v", err)
 	}
-	if len(samples) == 0 {
+	if *limit > 0 && *limit < len(refs) {
+		refs = refs[:*limit]
+	}
+	if len(refs) == 0 {
 		log.Fatalf("数据集 %s/%s 没有图片", *dataDir, *split)
 	}
-	log.Printf("加载 %d 张图（%d 类），开始校验...", len(samples), len(classList))
+	log.Printf("加载 %d 张图（%d 类），开始校验...", len(refs), len(classList))
 
-	// 收集 GT（框 + 多边形）。
-	gts := make([]eval.GroundTruth, 0, len(samples)*4)
-	for i, s := range samples {
-		for _, o := range s.Objects {
-			var rings [][]image.Point
-			if len(o.Polygon) > 0 {
-				rings = [][]image.Point{o.Polygon}
+	// 加载图片与 GT（标签解码成 data.Object）。
+	samples := make([]data.Sample, len(refs))
+	gts := make([]metric.GroundTruth, 0, len(refs)*4)
+	for i, ref := range refs {
+		img, w, h := loadImage(ctx, st, ref.ImageKey)
+		var objs []data.Object
+		if rc, err := st.Get(ctx, ref.LabelKey); err == nil {
+			buf := new(bytes.Buffer)
+			buf.ReadFrom(rc)
+			rc.Close()
+			if objs, err = codec.Decode(buf.Bytes(), w, h); err != nil {
+				log.Fatalf("解码标签 %s: %v", ref.LabelKey, err)
 			}
-			gts = append(gts, eval.GroundTruth{
-				ImageID: i, ClassID: o.ClassID,
-				X1: o.X1, Y1: o.Y1, X2: o.X2, Y2: o.Y2,
-				Rings: rings, W: s.W, H: s.H,
-			})
+		}
+		samples[i] = data.Sample{Key: ref.ImageKey, Image: img, W: w, H: h, Objects: objs}
+		for _, o := range objs {
+			gts = append(gts, metric.GroundTruth{ImageID: i, Object: o, W: w, H: h})
 		}
 	}
 
@@ -102,7 +123,21 @@ func main() {
 	}
 }
 
-func runDetect(modelPath string, imgsz int, classes []string, conf, iou float64, samples []dataset.Sample) ([]eval.Prediction, time.Duration, bool) {
+func loadImage(ctx context.Context, st *local.Storage, key string) (image.Image, int, int) {
+	rc, err := st.Get(ctx, key)
+	if err != nil {
+		log.Fatalf("读取图片 %s: %v", key, err)
+	}
+	defer rc.Close()
+	img, _, err := image.Decode(rc)
+	if err != nil {
+		log.Fatalf("解码图片 %s: %v", key, err)
+	}
+	b := img.Bounds()
+	return img, b.Dx(), b.Dy()
+}
+
+func runDetect(modelPath string, imgsz int, classes []string, conf, iou float64, samples []data.Sample) ([]metric.Prediction, time.Duration, bool) {
 	if _, err := os.Stat(modelPath); err != nil {
 		return nil, 0, false
 	}
@@ -115,7 +150,7 @@ func runDetect(modelPath string, imgsz int, classes []string, conf, iou float64,
 	}
 	defer eng.Close()
 
-	preds := make([]eval.Prediction, 0, len(samples)*4)
+	preds := make([]metric.Prediction, 0, len(samples)*4)
 	var total time.Duration
 	for i, s := range samples {
 		res, err := eng.Run(context.Background(), &engine.Request{Image: s.Image})
@@ -124,17 +159,18 @@ func runDetect(modelPath string, imgsz int, classes []string, conf, iou float64,
 		}
 		dr := res.(*engine.DetectionResult)
 		total += dr.Latency()
-		for _, d := range dr.Detections {
-			preds = append(preds, eval.Prediction{
-				ImageID: i, ClassID: d.ClassID, Confidence: d.Confidence,
-				X1: d.X1, Y1: d.Y1, X2: d.X2, Y2: d.Y2,
-			})
+		objs, err := data.ObjectsFromResult(res)
+		if err != nil {
+			log.Fatalf("结果转换失败: %v", err)
+		}
+		for _, o := range objs {
+			preds = append(preds, metric.Prediction{ImageID: i, Object: o})
 		}
 	}
 	return preds, total, true
 }
 
-func runSeg(modelPath string, imgsz int, classes []string, conf, iou, maskThr float64, samples []dataset.Sample) ([]eval.Prediction, time.Duration, bool) {
+func runSeg(modelPath string, imgsz int, classes []string, conf, iou, maskThr float64, samples []data.Sample) ([]metric.Prediction, time.Duration, bool) {
 	if _, err := os.Stat(modelPath); err != nil {
 		return nil, 0, false
 	}
@@ -148,7 +184,7 @@ func runSeg(modelPath string, imgsz int, classes []string, conf, iou, maskThr fl
 	}
 	defer eng.Close()
 
-	preds := make([]eval.Prediction, 0, len(samples)*4)
+	preds := make([]metric.Prediction, 0, len(samples)*4)
 	var total time.Duration
 	for i, s := range samples {
 		res, err := eng.Run(context.Background(), &engine.Request{Image: s.Image})
@@ -157,30 +193,20 @@ func runSeg(modelPath string, imgsz int, classes []string, conf, iou, maskThr fl
 		}
 		sr := res.(*engine.SegmentationResult)
 		total += sr.Latency()
-		for _, ins := range sr.Instances {
-			// seg 引擎的 Mask 是多条外轮廓（断开区域各自成环）；逐条转成 image.Point
-			// 保留为独立 ring，栅格化时取并集，避免拍平成一条自交多边形。
-			var rings [][]image.Point
-			for _, ring := range ins.Mask {
-				pts := make([]image.Point, 0, len(ring))
-				for _, p := range ring {
-					pts = append(pts, image.Pt(int(p.X), int(p.Y)))
-				}
-				rings = append(rings, pts)
-			}
-			preds = append(preds, eval.Prediction{
-				ImageID: i, ClassID: ins.ClassID, Confidence: ins.Confidence,
-				X1: ins.X1, Y1: ins.Y1, X2: ins.X2, Y2: ins.Y2,
-				Rings: rings,
-			})
+		objs, err := data.ObjectsFromResult(res)
+		if err != nil {
+			log.Fatalf("结果转换失败: %v", err)
+		}
+		for _, o := range objs {
+			preds = append(preds, metric.Prediction{ImageID: i, Object: o})
 		}
 	}
 	return preds, total, true
 }
 
-func printReport(title string, preds []eval.Prediction, gts []eval.GroundTruth, useMask bool, took time.Duration, nImages int, classes []string) {
-	perClass, mAP50 := eval.AP(preds, gts, 0.50, useMask)
-	_, mAP5095 := eval.MAPOverThresholds(preds, gts, useMask)
+func printReport(title string, preds []metric.Prediction, gts []metric.GroundTruth, useMask bool, took time.Duration, nImages int, classes []string) {
+	perClass, mAP50 := metric.AP(preds, gts, 0.50, useMask)
+	_, mAP5095 := metric.MAPOverThresholds(preds, gts, useMask)
 
 	fmt.Printf("==== %s ====\n", title)
 	fmt.Printf("mAP@.5      = %.4f\n", mAP50)
@@ -192,7 +218,6 @@ func printReport(title string, preds []eval.Prediction, gts []eval.GroundTruth, 
 	fmt.Printf("推理总耗时 %v（%.1f ms/张），预测 %d 个实例 / GT %d 个\n",
 		took, avgMs, len(preds), len(gts))
 
-	// 每类 AP（只列 GT 中出现过的类），按 AP 降序。
 	type row struct {
 		id   int
 		name string
@@ -218,9 +243,9 @@ func printReport(title string, preds []eval.Prediction, gts []eval.GroundTruth, 
 	fmt.Println()
 }
 
-func hasGT(gts []eval.GroundTruth, class int) bool {
+func hasGT(gts []metric.GroundTruth, class int) bool {
 	for _, g := range gts {
-		if g.ClassID == class {
+		if g.Object.ClassID == class {
 			return true
 		}
 	}

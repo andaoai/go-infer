@@ -12,18 +12,22 @@
 //	# 复制而非移动（保留采集池原件）：
 //	./bin/dataset promote --copy ...
 //
-// 每个引擎对应一个独立 YOLO 数据集（dataset/<engine>/），各自生成 data.yaml，
-// 避免不同类别体系的标签互相污染。提升记录写入 dataset/versions/。
+// 每个引擎对应一个独立数据集（<into>/<engine>/），按注入的 Codec 生成训练
+// 配置（YOLO 写 data.yaml），避免不同类别体系的标签互相污染。提升记录写入
+// <into>/versions/。
 package main
 
 import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/andaoai/go-infer/internal/appcfg"
+	"github.com/andaoai/go-infer/internal/format/yolo"
 	"github.com/andaoai/go-infer/internal/promote"
+	"github.com/andaoai/go-infer/internal/storage/local"
 )
 
 func main() {
@@ -61,8 +65,8 @@ promote flags:
 
 func runPromote(args []string) {
 	fs := flag.NewFlagSet("promote", flag.ExitOnError)
-	pool := fs.String("pool", "dataset/pool", "采集池根目录")
-	into := fs.String("into", "dataset", "数据集根目录")
+	poolDir := fs.String("pool", "dataset/pool", "采集池根目录")
+	intoDir := fs.String("into", "dataset", "数据集根目录")
 	engine := fs.String("engine", "", "只提升该引擎")
 	date := fs.String("date", "", "只提升该日期 YYYYMMDD")
 	classesFile := fs.String("classes", "models/coco.names", "类别名文件")
@@ -82,9 +86,26 @@ func runPromote(args []string) {
 		}
 	}
 
+	// pool 与 into 映射到同一个本地存储：取两者公共父目录为存储根，
+	// 各自相对路径作为存储前缀。
+	storeRoot, poolPrefix, dsPrefix, err := resolveStore(*poolDir, *intoDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "解析路径: %v\n", err)
+		os.Exit(1)
+	}
+	st, err := local.New(storeRoot)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "打开存储 %s: %v\n", storeRoot, err)
+		os.Exit(1)
+	}
+
+	intoAbs, _ := filepath.Abs(*intoDir)
 	res, err := promote.Run(promote.Options{
-		PoolDir:     *pool,
-		DatasetRoot: *into,
+		Store:       st,
+		Codec:       yolo.New(),
+		PoolRoot:    poolPrefix,
+		DatasetRoot: dsPrefix,
+		ConfigRoot:  intoAbs,
 		Engine:      *engine,
 		Date:        *date,
 		Classes:     classList,
@@ -103,9 +124,52 @@ func runPromote(args []string) {
 		fmt.Printf("  - %s / %s: %d 个\n", s.Engine, s.Date, s.Files)
 	}
 	if res.DataYAML != "" {
-		fmt.Printf("data.yaml: %s\n", res.DataYAML)
+		fmt.Printf("data.yaml: %s\n", filepath.Join(storeRoot, res.DataYAML))
 	}
 	if res.Manifest != "" {
-		fmt.Printf("版本清单: %s\n", res.Manifest)
+		fmt.Printf("版本清单: %s\n", filepath.Join(storeRoot, res.Manifest))
 	}
+}
+
+// resolveStore 取 pool 与 into 的公共父目录作为本地存储根，返回各自相对前缀。
+func resolveStore(pool, into string) (root, poolPrefix, dsPrefix string, err error) {
+	poolAbs, err := filepath.Abs(pool)
+	if err != nil {
+		return "", "", "", err
+	}
+	intoAbs, err := filepath.Abs(into)
+	if err != nil {
+		return "", "", "", err
+	}
+	common := commonParent(poolAbs, intoAbs)
+	rel := func(p string) string {
+		r, e := filepath.Rel(common, p)
+		if e != nil {
+			return filepath.ToSlash(p)
+		}
+		return filepath.ToSlash(r)
+	}
+	return common, rel(poolAbs), rel(intoAbs), nil
+}
+
+// commonParent 返回两个绝对路径最长的公共目录前缀。
+func commonParent(a, b string) string {
+	as := strings.Split(filepath.ToSlash(a), "/")
+	bs := strings.Split(filepath.ToSlash(b), "/")
+	n := len(as)
+	if len(bs) < n {
+		n = len(bs)
+	}
+	i := 0
+	for ; i < n; i++ {
+		if as[i] != bs[i] {
+			break
+		}
+	}
+	// 绝对路径以 "/" 开头，split 后第一段为空串；用 Join 拼回再补前导分隔符。
+	joined := filepath.Join(as[1:i]...)
+	if joined == "" {
+		return string(filepath.Separator)
+	}
+	return string(filepath.Separator) + joined
 }

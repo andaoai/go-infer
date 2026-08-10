@@ -2,7 +2,7 @@
 
 以 **Go 高并发为中心**的多框架、多算法推理服务。在各种机器（x86 服务器 / ARM 工控机 / 带 GPU 的工作站 / 半受信边缘节点）上完成推理任务，**不绑定具体算法，也不绑定具体推理框架**。
 
-> 当前状态：第一个引擎已落地——ONNX Runtime + YOLO 检测。架构已经按"可插拔引擎"搭好，后续加后端/算法只新增 `internal/engines/<框架>/<任务>/`，不动 HTTP 与调度层。
+> 当前状态：首个示范组合已落地——ONNX Runtime + YOLO 检测/分割 + 本地 FS + YOLO 标签。架构沿**任务 / 后端 / 存储 / 格式**四轴可插拔（`engine`/`storage`/`format` + 规范模型 `data`），换后端、存储或标签格式只新增实现，不动 HTTP、采集、回流、校验等闭环逻辑。
 >
 > 📐 架构与数据闭环（训练→部署→采集→回流重训）见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
@@ -195,10 +195,12 @@ go-infer/
 │   ├── validate/main.go            数据集校验入口：跑模型、算 mAP
 │   └── dataset/main.go             数据集回流入口：采集池 → 训练集
 ├── internal/
-│   ├── engine/                     引擎无关抽象：Engine/Request/Result/Task
-│   ├── api/                        HTTP 层，只依赖 engine 接口；可选 Recorder 钩子
-│   ├── dataset/                    YOLO 标签读取与写入（det 5 列 / seg 多边形）
-│   ├── eval/                       IoU、栅格化、COCO AP/mAP
+│   ├── engine/                     后端轴抽象：Engine/Request/Result/Task
+│   ├── data/                       规范模型 Object/BBox/Point + ObjectsFromResult
+│   ├── storage/                    存储轴：Storage 接口 + local/ 实现
+│   ├── format/                     格式轴：Codec 接口 + yolo/ 实现
+│   ├── metric/                     IoU、栅格化、COCO AP/mAP（消费 data.Object）
+│   ├── api/                        HTTP 层，只依赖接口；可选 Recorder 钩子
 │   ├── capture/                    推理采集器：策略采样 + 异步落盘 + 配额淘汰
 │   ├── promote/                    采集池按引擎合并进训练集 + 生成 data.yaml
 │   ├── appcfg/                     类别名加载（server/validate/dataset 共用）
@@ -266,9 +268,9 @@ CGO_ENABLED=1 go build -o bin/validate ./cmd/validate
 输出三张表：检测模型 box mAP、分割模型 box mAP、分割模型 mask mAP，各含 `mAP@.5` 与 COCO 风格 `mAP@.50:.95`，并附每类 AP@.5。
 
 实现要点（`internal/`）：
-- `dataset/` 解析 YOLO det（5 列）/ seg（多边形）标签，图片用标准库解码，无新依赖
-- `eval/` 框 IoU、多边形扫描线栅格化（掩膜降采样到长边 256 的位集 + popcount）、COCO 风格按类贪心匹配 + 全点插值 AP；匹配和栅格化只做一次，10 个 IoU 阈值共享
-- 引擎无关：任何实现 `Engine` 接口的后端都能接进来
+- `format/yolo` 解析 YOLO det（5 列）/ seg（多边形）标签，图片用标准库解码，无新依赖
+- `metric` 框 IoU、多边形扫描线栅格化（掩膜降采样到长边 256 的位集 + popcount）、COCO 风格按类贪心匹配 + 全点插值 AP；匹配和栅格化只做一次，10 个 IoU 阈值共享
+- 全程消费规范模型 `data.Object`，引擎结果经唯一一处 `data.ObjectsFromResult` 转换；校验逻辑与后端、标签格式、存储均解耦
 
 > 定位是回归/冒烟校验，不是中立 benchmark：coco128 是 COCO train2017 子集，官方 nano 权重在其上训练过，指标偏高；且 Go 掩膜双线性采样约定与 ultralytics 略有差异（raw mask IoU≈0.92），mask mAP 系统性低几个点属正常。实测全 128 张与 ultralytics `model.val()` 同参数结果接近（det box mAP@.5 ≈0.55 vs 官方 0.61，seg mask mAP@.5 ≈0.46 vs 官方 0.55）。
 

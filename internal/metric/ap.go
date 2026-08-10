@@ -1,28 +1,22 @@
-package eval
+package metric
 
 import (
-	"image"
 	"sort"
+
+	"github.com/andaoai/go-infer/internal/data"
 )
 
 // Prediction 是一个模型输出实例，按 ImageID 关联到某张图。
 type Prediction struct {
-	ImageID        int
-	ClassID        int
-	Confidence     float32
-	X1, Y1, X2, Y2 float32
-	// Rings 为分割任务的预测外轮廓（可能多条，对应断开区域；像素坐标）；
-	// 框任务为空。多条环在栅格化时取并集。
-	Rings [][]image.Point
+	ImageID int
+	Object  data.Object
 }
 
 // GroundTruth 是一个标注实例。W/H 为该实例所在图片尺寸，供掩膜栅格化。
 type GroundTruth struct {
-	ImageID        int
-	ClassID        int
-	X1, Y1, X2, Y2 float32
-	Rings          [][]image.Point
-	W, H           int
+	ImageID int
+	Object  data.Object
+	W, H    int
 }
 
 // AP 计算全部类别的平均精度（AP），返回各类 AP 和总体 mAP。
@@ -71,17 +65,16 @@ func buildMatches(preds []Prediction, gts []GroundTruth, useMask bool) map[int]*
 	if useMask {
 		predMasks = make([][]uint64, len(preds))
 		for i, p := range preds {
-			if len(p.Rings) > 0 {
-				// 用第一张图尺寸；同图预测/GT 尺寸一致。
+			if len(p.Object.Rings) > 0 {
 				w, h := imageDimsFor(gts, p.ImageID)
-				bits, _, _ := maskBits(p.Rings, w, h)
+				bits, _, _ := maskBits(p.Object.Rings, w, h)
 				predMasks[i] = bits
 			}
 		}
 		gtMasks = make([][]uint64, len(gts))
 		for i, g := range gts {
-			if len(g.Rings) > 0 {
-				bits, _, _ := maskBits(g.Rings, g.W, g.H)
+			if len(g.Object.Rings) > 0 {
+				bits, _, _ := maskBits(g.Object.Rings, g.W, g.H)
 				gtMasks[i] = bits
 			}
 		}
@@ -93,7 +86,7 @@ func buildMatches(preds []Prediction, gts []GroundTruth, useMask bool) map[int]*
 	nGTByClass := map[int]int{}
 
 	for i, g := range gts {
-		c := g.ClassID
+		c := g.Object.ClassID
 		if gtIdxByClass[c] == nil {
 			gtIdxByClass[c] = map[int][]int{}
 		}
@@ -101,14 +94,13 @@ func buildMatches(preds []Prediction, gts []GroundTruth, useMask bool) map[int]*
 		nGTByClass[c]++
 	}
 	for i, p := range preds {
-		predIdxByClass[p.ClassID] = append(predIdxByClass[p.ClassID], i)
+		predIdxByClass[p.Object.ClassID] = append(predIdxByClass[p.Object.ClassID], i)
 	}
 
 	out := map[int]*classMatches{}
 	for c, cp := range predIdxByClass {
-		// 预测按置信度降序。
 		sort.SliceStable(cp, func(a, b int) bool {
-			return preds[cp[a]].Confidence > preds[cp[b]].Confidence
+			return preds[cp[a]].Object.Confidence > preds[cp[b]].Object.Confidence
 		})
 		matched := make([]bool, len(gts))
 		cm := &classMatches{nGT: nGTByClass[c]}
@@ -127,10 +119,7 @@ func buildMatches(preds []Prediction, gts []GroundTruth, useMask bool) map[int]*
 						iou = bitsetIoU(predMasks[pi], gtMasks[gi])
 					}
 				} else {
-					iou = BoxIoU(
-						Box{X1: p.X1, Y1: p.Y1, X2: p.X2, Y2: p.Y2},
-						Box{X1: gts[gi].X1, Y1: gts[gi].Y1, X2: gts[gi].X2, Y2: gts[gi].Y2},
-					)
+					iou = BoxIoU(p.Object.BBox, gts[gi].Object.BBox)
 				}
 				if iou > bestIOU {
 					bestIOU = iou
@@ -140,14 +129,12 @@ func buildMatches(preds []Prediction, gts []GroundTruth, useMask bool) map[int]*
 			if bestGT >= 0 {
 				matched[bestGT] = true
 			}
-			cm.values = append(cm.values, match{conf: p.Confidence, iou: bestIOU})
+			cm.values = append(cm.values, match{conf: p.Object.Confidence, iou: bestIOU})
 		}
-		// 没有该类预测但有 GT 的类也要占位（AP=0）。
 		if _, exists := out[c]; !exists {
 			out[c] = cm
 		}
 	}
-	// 补全"有 GT 无预测"的类。
 	for c, n := range nGTByClass {
 		if _, ok := out[c]; !ok {
 			out[c] = &classMatches{nGT: n}
@@ -171,7 +158,6 @@ func classAP(cm *classMatches, iouThresh float64) float64 {
 	if cm == nil || cm.nGT == 0 {
 		return 0
 	}
-	// values 已按置信度降序。
 	nGT := float64(cm.nGT)
 	prec := make([]float64, len(cm.values))
 	rec := make([]float64, len(cm.values))
@@ -186,8 +172,6 @@ func classAP(cm *classMatches, iouThresh float64) float64 {
 	if tp == 0 {
 		return 0
 	}
-	// 全点插值：pInterp(r_i) = max_{k>=i} P(r_k)，
-	// AP = sum_i (r_i - r_{i-1}) * pInterp(r_i)，r_{-1}=0。
 	pInterp := make([]float64, len(prec))
 	maxP := 0.0
 	for i := len(prec) - 1; i >= 0; i-- {
@@ -222,11 +206,10 @@ func MAPOverThresholds(preds []Prediction, gts []GroundTruth, useMask bool) (map
 func mAPFromMatches(matches map[int]*classMatches, thresh float64) float64 {
 	var sum float64
 	n := 0
-	for c, cm := range matches {
+	for _, cm := range matches {
 		if cm.nGT == 0 {
 			continue
 		}
-		_ = c
 		sum += classAP(cm, thresh)
 		n++
 	}

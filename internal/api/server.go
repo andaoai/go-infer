@@ -41,14 +41,14 @@ func NewServer() *Server {
 }
 
 // CaptureSample 是一次推理结果的采集输入（引擎无关）。
+// Result 携带引擎原生结果，采集器自行用 data.ObjectsFromResult 统一转换，
+// 避免 api 层重复 type switch。
 type CaptureSample struct {
-	Engine     string
-	Task       engine.Task
-	Image      []byte // 原始上传字节
-	W, H       int
-	ImgExt     string // ".jpg"/".png"
-	Detections []engine.Detection
-	Instances  []engine.Instance
+	Engine string
+	Image  []byte // 原始上传字节
+	W, H   int
+	ImgExt string // ".jpg"/".png"
+	Result engine.Result
 }
 
 // Recorder 是可选的推理采集器（internal/capture 实现）。
@@ -178,32 +178,19 @@ func (s *Server) handlePredict(w http.ResponseWriter, r *http.Request) {
 	switch r := res.(type) {
 	case *engine.DetectionResult:
 		resp.Detections = r.Detections
-		if s.recorder != nil && !vis {
-			b := img.Bounds()
-			s.recorder.Record(CaptureSample{
-				Engine:     eng.Name(),
-				Task:       res.Task(),
-				Image:      raw,
-				W:          b.Dx(),
-				H:          b.Dy(),
-				ImgExt:     "." + format,
-				Detections: r.Detections,
-			})
-		}
 	case *engine.SegmentationResult:
 		resp.Instances = r.Instances
-		if s.recorder != nil && !vis {
-			b := img.Bounds()
-			s.recorder.Record(CaptureSample{
-				Engine:    eng.Name(),
-				Task:      res.Task(),
-				Image:     raw,
-				W:         b.Dx(),
-				H:         b.Dy(),
-				ImgExt:    "." + format,
-				Instances: r.Instances,
-			})
-		}
+	}
+	if s.recorder != nil {
+		b := img.Bounds()
+		s.recorder.Record(CaptureSample{
+			Engine: eng.Name(),
+			Image:  raw,
+			W:      b.Dx(),
+			H:      b.Dy(),
+			ImgExt: "." + format,
+			Result: res,
+		})
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

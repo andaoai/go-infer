@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/andaoai/go-infer/internal/engine"
+	"github.com/andaoai/go-infer/internal/format/yolo"
+	"github.com/andaoai/go-infer/internal/storage/local"
 )
 
 func fixedClock() func() time.Time {
@@ -16,10 +18,18 @@ func fixedClock() func() time.Time {
 	return func() time.Time { return t }
 }
 
-func newTestRecorder(t *testing.T, cfg Config) *Recorder {
+func newTestRecorder(t *testing.T, cfg Config) (*Recorder, string) {
 	t.Helper()
-	if cfg.Dir == "" {
-		cfg.Dir = t.TempDir()
+	root := t.TempDir()
+	st, err := local.New(root)
+	if err != nil {
+		t.Fatalf("local storage: %v", err)
+	}
+	if cfg.Store == nil {
+		cfg.Store = st
+	}
+	if cfg.Codec == nil {
+		cfg.Codec = yolo.New()
 	}
 	if cfg.Now == nil {
 		cfg.Now = fixedClock()
@@ -31,25 +41,37 @@ func newTestRecorder(t *testing.T, cfg Config) *Recorder {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	return r
+	return r, root
 }
 
 func detSample(conf float32) Sample {
 	return Sample{
-		Engine: "yolov8n", Task: engine.TaskDetection,
-		Image: []byte("FAKEJPEG"), W: 100, H: 100, ImgExt: ".jpg",
-		Detections: []engine.Detection{{ClassID: 0, Confidence: conf, X1: 0, Y1: 0, X2: 10, Y2: 10}},
+		Engine: "yolov8n",
+		Image:  []byte("FAKEJPEG"), W: 100, H: 100, ImgExt: ".jpg",
+		Result: &engine.DetectionResult{
+			Detections: []engine.Detection{
+				{ClassID: 0, Confidence: conf, X1: 0, Y1: 0, X2: 10, Y2: 10},
+			},
+		},
+	}
+}
+
+func noDetSample() Sample {
+	return Sample{
+		Engine: "yolov8n",
+		Image:  []byte("FAKEJPEG"), W: 100, H: 100, ImgExt: ".jpg",
+		Result: &engine.DetectionResult{},
 	}
 }
 
 func TestShouldCaptureRules(t *testing.T) {
-	r := newTestRecorder(t, Config{Rate: 0.1, LowConf: 0.25})
+	r, _ := newTestRecorder(t, Config{Rate: 0.1, LowConf: 0.25})
 
 	// 无检测 -> 必存
-	if !r.shouldCapture(Sample{Engine: "e", W: 1, H: 1, Image: []byte{1}}) {
+	if !r.shouldCapture(noDetSample()) {
 		t.Error("无检测样本应必存")
 	}
-	// 低置信度（低于阈值）-> 必存
+	// 低置信度 -> 必存
 	if !r.shouldCapture(detSample(0.1)) {
 		t.Error("低置信度样本应必存")
 	}
@@ -66,46 +88,55 @@ func TestShouldCaptureRules(t *testing.T) {
 }
 
 func TestWriteLayoutAndFiles(t *testing.T) {
-	dir := t.TempDir()
-	r := newTestRecorder(t, Config{Dir: dir, Rate: 1})
+	r, root := newTestRecorder(t, Config{Rate: 1})
 	r.Record(detSample(0.9))
 	r.Close()
 
-	wantImg := filepath.Join(dir, "yolov8n", "20260810", "images")
-	wantLbl := filepath.Join(dir, "yolov8n", "20260810", "labels")
-	imgs, _ := os.ReadDir(wantImg)
-	lbls, _ := os.ReadDir(wantLbl)
-	if len(imgs) != 1 || !strings.HasSuffix(imgs[0].Name(), ".jpg") {
+	wantImg := filepath.Join(root, "yolov8n", "20260810", "images")
+	wantLbl := filepath.Join(root, "yolov8n", "20260810", "labels")
+	imgs, _ := filepath.Glob(filepath.Join(wantImg, "*.jpg"))
+	lbls, _ := filepath.Glob(filepath.Join(wantLbl, "*.txt"))
+	if len(imgs) != 1 {
 		t.Fatalf("图片落盘异常: %v", imgs)
 	}
-	if len(lbls) != 1 || !strings.HasSuffix(lbls[0].Name(), ".txt") {
+	if len(lbls) != 1 {
 		t.Fatalf("标签落盘异常: %v", lbls)
 	}
-	// 文件名格式 HHMMSS_<hex>
-	name := imgs[0].Name()
+	name := filepath.Base(imgs[0])
 	if !strings.HasPrefix(name, "143052_") {
 		t.Errorf("文件名前缀应为时分秒，got %s", name)
+	}
+	// 标签内容合法 YOLO 框
+	b := readFile(t, lbls[0])
+	if !strings.HasPrefix(b, "0 ") {
+		t.Errorf("标签应为 cls cx cy w h 行，got %q", b)
 	}
 }
 
 func TestQuotaEviction(t *testing.T) {
-	dir := t.TempDir()
-	// 每个样本约 8 字节图 + 36 字节标签 ≈ 44 字节；配额 90 应只保留约 2 个。
-	r := newTestRecorder(t, Config{Dir: dir, Rate: 1, QuotaBytes: 90})
+	r, root := newTestRecorder(t, Config{Rate: 1, QuotaBytes: 90})
 	for i := 0; i < 6; i++ {
 		r.Record(detSample(0.9))
 	}
 	r.Close()
 
-	var imgs int
-	_ = filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
-		if err == nil && !info.IsDir() && strings.HasSuffix(p, ".jpg") {
-			imgs++
-		}
-		return nil
-	})
-	if imgs > 2 {
-		t.Errorf("配额未生效，剩余图片 %d 张（应 <=2）", imgs)
+	imgs, _ := filepath.Glob(filepath.Join(root, "yolov8n", "20260810", "images", "*.jpg"))
+	if len(imgs) > 2 {
+		t.Errorf("配额未生效，剩余图片 %d 张（应 <=2）", len(imgs))
+	}
+}
+
+func TestHardNegativeWritesEmptyLabel(t *testing.T) {
+	r, root := newTestRecorder(t, Config{Rate: 1})
+	r.Record(noDetSample())
+	r.Close()
+
+	lbls, _ := filepath.Glob(filepath.Join(root, "yolov8n", "20260810", "labels", "*.txt"))
+	if len(lbls) != 1 {
+		t.Fatalf("hard negative 应落空标签，got %v", lbls)
+	}
+	if b := readFile(t, lbls[0]); b != "" {
+		t.Errorf("空检测应为空标签，got %q", b)
 	}
 }
 
@@ -120,8 +151,17 @@ func TestSanitizeEngineName(t *testing.T) {
 
 func TestNilRecorderSafe(t *testing.T) {
 	var r *Recorder
-	r.Record(detSample(0.9)) // 不应 panic
+	r.Record(detSample(0.9))
 	if err := r.Close(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func readFile(t *testing.T, p string) string {
+	t.Helper()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }

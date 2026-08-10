@@ -1,8 +1,10 @@
-package eval
+package metric
 
 import (
 	"image"
 	"math/bits"
+
+	"github.com/andaoai/go-infer/internal/data"
 )
 
 // maskMaxSide 是掩膜栅格化的目标长边像素数。多边形先等比缩放到该分辨率，
@@ -11,9 +13,9 @@ import (
 // 长边引入的 IoU 误差 <1%，而速度提升一个数量级）。
 const maskMaxSide = 256
 
-// maskBits 把一组外轮廓等比缩放到长边 maskMaxSide 后栅格化为位集。
+// maskBits 把一组外轮廓（规范 data.Point）等比缩放到长边 maskMaxSide 后栅格化为位集。
 // 返回位集、网格宽高；空轮廓返回 nil。
-func maskBits(rings [][]image.Point, w, h int) ([]uint64, int, int) {
+func maskBits(rings [][]data.Point, w, h int) ([]uint64, int, int) {
 	if w <= 0 || h <= 0 || len(rings) == 0 {
 		return nil, 0, 0
 	}
@@ -65,7 +67,6 @@ func fillBitset(bitset []uint64, poly []image.Point, w, h, stride int) {
 				xs = append(xs, e.x0+float64(y-e.yMin)*e.dx)
 			}
 		}
-		// 排序交点两两配对。
 		for i := 1; i < len(xs); i++ {
 			for j := i; j > 0 && xs[j-1] > xs[j]; j-- {
 				xs[j-1], xs[j] = xs[j], xs[j-1]

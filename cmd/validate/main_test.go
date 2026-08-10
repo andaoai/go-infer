@@ -1,19 +1,25 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"image"
+	_ "image/jpeg"
+	_ "image/png"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
 	"github.com/andaoai/go-infer/internal/appcfg"
-	"github.com/andaoai/go-infer/internal/dataset"
+	"github.com/andaoai/go-infer/internal/data"
 	"github.com/andaoai/go-infer/internal/engine"
 	"github.com/andaoai/go-infer/internal/engines/onnxruntime/detect"
 	"github.com/andaoai/go-infer/internal/engines/onnxruntime/seg"
-	"github.com/andaoai/go-infer/internal/eval"
+	"github.com/andaoai/go-infer/internal/format/yolo"
+	"github.com/andaoai/go-infer/internal/metric"
 	"github.com/andaoai/go-infer/internal/ortenv"
+	"github.com/andaoai/go-infer/internal/storage/local"
 )
 
 var ortOnce sync.Once
@@ -35,22 +41,72 @@ func exists(p string) bool {
 	return err == nil
 }
 
-func buildGTs(samples []dataset.Sample) []eval.GroundTruth {
-	gts := make([]eval.GroundTruth, 0, len(samples)*4)
-	for i, s := range samples {
-		for _, o := range s.Objects {
-			var rings [][]image.Point
-			if len(o.Polygon) > 0 {
-				rings = [][]image.Point{o.Polygon}
+// loadSamples 用 codec + storage 加载前 limit 张样本，组装 GT。
+func loadSamples(t *testing.T, dataDir, split string, limit int) ([]data.Sample, []metric.GroundTruth) {
+	t.Helper()
+	storeRoot := filepath.Dir(filepath.Clean(dataDir))
+	dsPrefix := filepath.Base(filepath.Clean(dataDir))
+	st, err := local.New(storeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codec := yolo.New()
+	ctx := context.Background()
+	refs, err := codec.ListImages(ctx, st, dsPrefix, split)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if limit > 0 && limit < len(refs) {
+		refs = refs[:limit]
+	}
+	samples := make([]data.Sample, len(refs))
+	gts := make([]metric.GroundTruth, 0, len(refs)*4)
+	for i, ref := range refs {
+		rc, err := st.Get(ctx, ref.ImageKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		img, _, err := image.Decode(rc)
+		rc.Close()
+		if err != nil {
+			t.Fatalf("解码图片 %s: %v", ref.ImageKey, err)
+		}
+		b := img.Bounds()
+		w, h := b.Dx(), b.Dy()
+		var objs []data.Object
+		if lrc, err := st.Get(ctx, ref.LabelKey); err == nil {
+			buf := new(bytes.Buffer)
+			buf.ReadFrom(lrc)
+			lrc.Close()
+			if objs, err = codec.Decode(buf.Bytes(), w, h); err != nil {
+				t.Fatalf("解码标签 %s: %v", ref.LabelKey, err)
 			}
-			gts = append(gts, eval.GroundTruth{
-				ImageID: i, ClassID: o.ClassID,
-				X1: o.X1, Y1: o.Y1, X2: o.X2, Y2: o.Y2,
-				Rings: rings, W: s.W, H: s.H,
-			})
+		}
+		samples[i] = data.Sample{Key: ref.ImageKey, Image: img, W: w, H: h, Objects: objs}
+		for _, o := range objs {
+			gts = append(gts, metric.GroundTruth{ImageID: i, Object: o, W: w, H: h})
 		}
 	}
-	return gts
+	return samples, gts
+}
+
+func runPreds(t *testing.T, eng engine.Engine, samples []data.Sample) []metric.Prediction {
+	t.Helper()
+	preds := make([]metric.Prediction, 0, len(samples)*4)
+	for i, s := range samples {
+		res, err := eng.Run(context.Background(), &engine.Request{Image: s.Image})
+		if err != nil {
+			t.Fatalf("第 %d 张推理失败: %v", i, err)
+		}
+		objs, err := data.ObjectsFromResult(res)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, o := range objs {
+			preds = append(preds, metric.Prediction{ImageID: i, Object: o})
+		}
+	}
+	return preds
 }
 
 // TestValidateOnCoco128Subset 用真实模型在 coco128-seg 的前 16 张上端到端校验，
@@ -70,14 +126,7 @@ func TestValidateOnCoco128Subset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	samples, err := dataset.Load(dataDir, "train2017")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(samples) > 16 {
-		samples = samples[:16]
-	}
-	gts := buildGTs(samples)
+	samples, gts := loadSamples(t, dataDir, "train2017", 16)
 
 	if exists("../../models/yolov8n.onnx") {
 		eng, err := detect.New(detect.Config{
@@ -88,20 +137,8 @@ func TestValidateOnCoco128Subset(t *testing.T) {
 		if err != nil {
 			t.Fatalf("加载检测模型: %v", err)
 		}
-		preds := make([]eval.Prediction, 0, 64)
-		for i, s := range samples {
-			res, err := eng.Run(context.Background(), &engine.Request{Image: s.Image})
-			if err != nil {
-				t.Fatal(err)
-			}
-			for _, d := range res.(*engine.DetectionResult).Detections {
-				preds = append(preds, eval.Prediction{
-					ImageID: i, ClassID: d.ClassID, Confidence: d.Confidence,
-					X1: d.X1, Y1: d.Y1, X2: d.X2, Y2: d.Y2,
-				})
-			}
-		}
-		_, map50 := eval.AP(preds, gts, 0.5, false)
+		preds := runPreds(t, eng, samples)
+		_, map50 := metric.AP(preds, gts, 0.5, false)
 		t.Logf("det box mAP@.5 = %.4f", map50)
 		if map50 < 0.4 {
 			t.Errorf("检测 mAP@.5 = %.3f，低于回归下限 0.4", map50)
@@ -120,29 +157,9 @@ func TestValidateOnCoco128Subset(t *testing.T) {
 		if err != nil {
 			t.Fatalf("加载分割模型: %v", err)
 		}
-		preds := make([]eval.Prediction, 0, 64)
-		for i, s := range samples {
-			res, err := eng.Run(context.Background(), &engine.Request{Image: s.Image})
-			if err != nil {
-				t.Fatal(err)
-			}
-			for _, ins := range res.(*engine.SegmentationResult).Instances {
-				var rings [][]image.Point
-				for _, ring := range ins.Mask {
-					pts := make([]image.Point, 0, len(ring))
-					for _, p := range ring {
-						pts = append(pts, image.Pt(int(p.X), int(p.Y)))
-					}
-					rings = append(rings, pts)
-				}
-				preds = append(preds, eval.Prediction{
-					ImageID: i, ClassID: ins.ClassID, Confidence: ins.Confidence,
-					X1: ins.X1, Y1: ins.Y1, X2: ins.X2, Y2: ins.Y2, Rings: rings,
-				})
-			}
-		}
-		_, box50 := eval.AP(preds, gts, 0.5, false)
-		_, mask50 := eval.AP(preds, gts, 0.5, true)
+		preds := runPreds(t, eng, samples)
+		_, box50 := metric.AP(preds, gts, 0.5, false)
+		_, mask50 := metric.AP(preds, gts, 0.5, true)
 		t.Logf("seg box mAP@.5 = %.4f  mask mAP@.5 = %.4f", box50, mask50)
 		if box50 < 0.35 {
 			t.Errorf("分割 box mAP@.5 = %.3f，低于回归下限 0.35", box50)
