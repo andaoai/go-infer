@@ -40,6 +40,23 @@ cp /path/to/your/best.onnx models/best.onnx
   -addr :8080
 ```
 
+### 案例：官方 yolov8n + bus.jpg
+
+仓库已附带官方权重 [models/yolov8n.onnx](models/yolov8n.onnx)、COCO 80 类名 [models/coco.names](models/coco.names) 和测试图 [examples/bus.jpg](examples/bus.jpg)，可直接跑：
+
+```bash
+# 启动服务
+./bin/yolo-server -model models/yolov8n.onnx -classes-file models/coco.names
+
+# 另开一个终端：JSON 结果
+curl -X POST -F "file=@examples/bus.jpg" "http://localhost:8080/predict?conf=0.5"
+
+# 或生成画框结果图
+curl -X POST -F "file=@examples/bus.jpg" "http://localhost:8080/predict?conf=0.5&vis=1" -o out.jpg
+```
+
+预期输出 3 个 person + 1 个 bus，参考效果见 [examples/bus_result.jpg](examples/bus_result.jpg)。
+
 ## API
 
 ### `GET /health`
@@ -97,8 +114,9 @@ curl -X POST -F "file=@test.jpg" "http://localhost:8080/predict?conf=0.5&vis=1" 
 | 参数 | 说明 | 默认 |
 |------|------|------|
 | `-model` | ONNX 模型路径 | `models/best.onnx` |
-| `-classes` | 类别名，逗号分隔 | 按 `-nc` 生成 `class_0...` |
-| `-nc` | 类别数（`-classes` 未提供时用） | 1 |
+| `-classes` | 类别名，逗号分隔 | 按 `-classes-file` 或 `-nc` |
+| `-classes-file` | 类别名文件，一行一个 | 空 |
+| `-nc` | 类别数（前两者均未提供时用） | 1 |
 | `-imgsz` | 模型输入尺寸（正方形） | 640 |
 | `-conf` | 默认置信度阈值 | 0.25 |
 | `-iou` | NMS IoU 阈值 | 0.45 |

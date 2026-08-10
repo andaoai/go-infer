@@ -5,7 +5,8 @@
 # ONNX Runtime 依赖（make ort 下载，不入库）
 /third_party/
 
-# 模型与测试产物
-/models/*.onnx
-*.jpg
-*.png
+# 用户自有模型（保留官方 yolov8n.onnx 案例权重）
+/models/best.onnx
+/models/*best*.onnx
+*.tmp.jpg
+*.tmp.png
