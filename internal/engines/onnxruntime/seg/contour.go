@@ -1,96 +1,142 @@
 package seg
 
-// contour 从二值掩膜（true=前景）中追踪外轮廓，返回多条闭合多边形。
+// point 是掩膜上的一个整数坐标点（局部坐标系，原点在框左上角）。
+type point struct{ x, y int }
+
+// contour 从二值掩膜（true=前景）提取每个连通域的外轮廓，返回多条闭合多边形。
 //
-// 采用简化的 Moore 邻域追踪：扫描到一个未访问的前景边界像素后，沿其
-// 8-邻域顺时针绕行回到起点；被追踪过的像素标记 visited，避免重复。
+// 等价于 OpenCV 的 findContours(RETR_EXTERNAL, CHAIN_APPROX_SIMPLE)：
+//  1. 8-连通连通域标记，把碎裂的前景像素分组成若干实例
+//  2. 每个连通域取最上最左的边界点做 Moore 邻域外轮廓追踪
+//  3. RDP 算法压缩共线点
+//
 // 掩膜坐标原点在左上角，x 向右、y 向下。
 func contour(mask []bool, w, h int) [][]point {
 	if w <= 0 || h <= 0 || len(mask) != w*h {
 		return nil
 	}
-	visited := make([]bool, len(mask))
-	var polys [][]point
 
+	labels := make([]int, len(mask))
+	type component struct {
+		pixels []int
+		label  int
+	}
+	var components []component
+	nextLabel := 1
+
+	// 8-连通洪水填充标记。
 	for y := 0; y < h; y++ {
 		for x := 0; x < w; x++ {
 			idx := y*w + x
-			if !mask[idx] || visited[idx] {
+			if !mask[idx] || labels[idx] != 0 {
 				continue
 			}
-			// 只把"与背景或图像边缘相邻"的像素当作轮廓起点，减少内部扫描。
-			if !isBoundary(mask, w, h, x, y) {
-				continue
-			}
-			poly := traceOne(mask, visited, w, h, x, y)
-			if len(poly) >= 3 {
-				polys = append(polys, simplify(poly))
-			}
+			pixels := floodFill(mask, labels, w, h, x, y, nextLabel)
+			components = append(components, component{pixels, nextLabel})
+			nextLabel++
+		}
+	}
+
+	var polys [][]point
+	for _, c := range components {
+		if poly := traceOuter(mask, labels, w, h, c.pixels, c.label); len(poly) >= 3 {
+			polys = append(polys, simplify(poly))
 		}
 	}
 	return polys
 }
 
-type point struct{ x, y int }
+// floodFill 从 (sx,sy) 做 8-连通 BFS，标记 label 并返回该连通域所有像素下标。
+func floodFill(mask []bool, labels []int, w, h, sx, sy, label int) []int {
+	stack := []int{sy*w + sx}
+	labels[stack[0]] = label
+	var pixels []int
+	for len(stack) > 0 {
+		idx := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		pixels = append(pixels, idx)
+		x, y := idx%w, idx/w
+		for dy := -1; dy <= 1; dy++ {
+			ny := y + dy
+			if ny < 0 || ny >= h {
+				continue
+			}
+			for dx := -1; dx <= 1; dx++ {
+				if dx == 0 && dy == 0 {
+					continue
+				}
+				nx := x + dx
+				if nx < 0 || nx >= w {
+					continue
+				}
+				ni := ny*w + nx
+				if mask[ni] && labels[ni] == 0 {
+					labels[ni] = label
+					stack = append(stack, ni)
+				}
+			}
+		}
+	}
+	return pixels
+}
 
-// 8-邻域，顺时针顺序，起点为正上方。
+// 8-邻域，顺序：从正上方开始顺时针。
 var nbr8 = [8][2]int{
 	{0, -1}, {1, -1}, {1, 0}, {1, 1},
 	{0, 1}, {-1, 1}, {-1, 0}, {-1, -1},
 }
 
-func isBoundary(mask []bool, w, h, x, y int) bool {
-	for _, n := range nbr8 {
-		nx, ny := x+n[0], y+n[1]
-		if nx < 0 || ny < 0 || nx >= w || ny >= h || !mask[ny*w+nx] {
-			return true
+// traceOuter 用 Moore 邻域追踪单个连通域（标签 compLabel）的外轮廓。
+//
+// 取该连通域最上最左的边界像素为起点，沿邻域顺时针绕行一周回到起点。
+// 只把属于本连通域的像素当作"前景"，避免穿到其他实例（即使它们也在掩膜中）。
+func traceOuter(mask []bool, labels []int, w, h int, pixels []int, compLabel int) []point {
+	// 找最上最左像素（y 最小，同 y 取 x 最小）——它一定是外边界点。
+	sx, sy := w, h
+	for _, idx := range pixels {
+		x, y := idx%w, idx/w
+		if y < sy || (y == sy && x < sx) {
+			sx, sy = x, y
 		}
 	}
-	return false
-}
 
-// traceOne 从 (sx,sy) 出发沿边界绕行一周，标记 visited。
-func traceOne(mask []bool, visited []bool, w, h, sx, sy int) []point {
 	var poly []point
 	x, y := sx, sy
-	startDir := 0 // 进入方向；下一个候选从其反方向开始
+	// backDir 是"我们从哪个方向进入当前像素"的邻域索引；下一个候选从
+	// (backDir+1)%8 开始顺时针搜，保证始终贴外边界走。
+	backDir := 6 // 起点：假定从左邻域(-1,0)进入，先向上方找
+
 	for {
-		idx := y*w + x
-		if !visited[idx] {
-			visited[idx] = true
-			poly = append(poly, point{x, y})
-		}
+		poly = append(poly, point{x, y})
 		found := false
 		for k := 0; k < 8; k++ {
-			d := (startDir + k) % 8
+			d := (backDir + k) % 8
 			nx, ny := x+nbr8[d][0], y+nbr8[d][1]
 			if nx < 0 || ny < 0 || nx >= w || ny >= h {
 				continue
 			}
-			if mask[ny*w+nx] {
-				// 记录进入方向：下一步从当前方向的"后方"搜起。
-				startDir = (d + 4 + 1) % 8
+			if labels[ny*w+nx] == compLabel {
+				// 进入 (nx,ny) 的方向是 d 的反向；下一次从其顺时针下一个搜起。
+				backDir = (d + 5) % 8 // 反方向再 -1（顺时针优先）
 				x, y = nx, ny
 				found = true
 				break
 			}
 		}
 		if !found {
-			break // 孤立像素，已加入
+			break // 孤立像素
 		}
 		if x == sx && y == sy {
 			break
 		}
-		// 防御性上限，避免异常掩膜造成死循环。
 		if len(poly) > w*h {
-			break
+			break // 防御性上限
 		}
 	}
 	return poly
 }
 
-// simplify 用 Ramer-Douglas-Peucker 算法剔除共线点，压缩点数
-// （逐像素的轮廓会产生很大 JSON/渲染开销）。
+// simplify 用 Ramer-Douglas-Peucker 算法剔除共线点，压缩点数。
 func simplify(p []point) []point {
 	if len(p) <= 4 {
 		return p

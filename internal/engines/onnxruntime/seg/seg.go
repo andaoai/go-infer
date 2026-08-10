@@ -323,7 +323,7 @@ func (e *Engine) makeMasks(cands []cand, lb *preprocess.Letterboxed, orig image.
 		// 在掩膜原型空间内只处理落在框内的像素，双线性采样加权和并 sigmoid。
 		mask := make([]bool, bw*bh)
 		for py := 0; py < bh; py++ {
-			my := (float32(py) + 0.5 + ix1) * sy // 掩膜空间 y（像素中心）
+			my := (float32(py) + 0.5 + iy1) * sy // 掩膜空间 y（像素中心，注意用 iy1 而非 ix1）
 			for px := 0; px < bw; px++ {
 				mx := (float32(px) + 0.5 + ix1) * sx
 				v := e.sampleProto(mx, my, c.coeffs)
