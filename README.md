@@ -187,10 +187,16 @@ JSON 响应：
 
 ```
 go-infer/
-├── cmd/server/main.go              入口：加载 ORT、注册引擎、启动 HTTP
+├── cmd/
+│   ├── server/main.go              HTTP 服务入口：加载 ORT、注册引擎、启动服务
+│   └── validate/main.go            数据集校验入口：跑模型、算 mAP
 ├── internal/
 │   ├── engine/                     引擎无关抽象：Engine/Request/Result/Task
 │   ├── api/                        HTTP 层，只依赖 engine 接口
+│   ├── dataset/                    YOLO 标签读取（det 5 列 / seg 多边形）
+│   ├── eval/                       IoU、栅格化、COCO AP/mAP
+│   ├── appcfg/                     类别名加载（server/validate 共用）
+│   ├── ortenv/                     ORT 动态库查找与初始化（共用）
 │   ├── preprocess/                 可复用视觉工具：letterbox/缩放/NCHW
 │   └── engines/
 │       └── onnxruntime/
@@ -198,6 +204,7 @@ go-infer/
 │           └── seg/                ORT + YOLOv8-seg 实例分割引擎
 ├── models/                         模型权重与类名（yolov8n 为案例）
 ├── examples/                       bus.jpg 与参考结果图
+├── testdata/                       coco128-seg 等校验数据集（gitignored）
 ├── third_party/onnxruntime/        make ort 下载位置（gitignored）
 ├── Makefile
 └── go.mod
@@ -223,12 +230,50 @@ type Engine interface {
 
 当前 ONNX Runtime 引擎经 CGO 绑定，运行时需要 `libonnxruntime.so`，**不是纯静态二进制**（这一点与 wfmon 不同；端侧/纯 Go 后端是后续探索方向）。`make ort` 自动下载 ORT 1.20.0 到 `third_party/`，程序按 `-ort-lib` → `third_party/` → `LD_LIBRARY_PATH` → 系统路径顺序查找。
 
+## 数据集校验（mAP）
+
+`cmd/validate` 在带标注的 YOLO 数据集上跑检测/分割模型并输出 mAP，用于回归校验（防坐标错位、阈值退化、后处理 bug）。读取标准 YOLO 目录结构：
+
+```
+<root>/images/<split>/*.jpg
+<root>/labels/<split>/*.txt   # cls x1 y1 x2 y2 ...（seg 多边形）或 cls cx cy w h（det 框）
+```
+
+一份 seg 标签同时提供掩膜 GT（多边形本身）和检测框 GT（点列 min/max），因此可同时校验两个模型、三种指标。
+
+```bash
+# 下载官方 coco128-seg（COCO train2017 前 128 张，约 7MB）+ 构建校验器 + 跑全量
+make validate
+
+# 等价于：
+make coco128-seg
+CGO_ENABLED=1 go build -o bin/validate ./cmd/validate
+./bin/validate -data testdata/coco128-seg -split train2017
+
+# 只跑前 N 张冒烟；指定自己的数据集/模型
+./bin/validate -data /path/to/dataset -split val -limit 16 \
+  -det-model models/best-det.onnx -seg-model models/best-seg.onnx \
+  -classes-file models/my.names
+```
+
+输出三张表：检测模型 box mAP、分割模型 box mAP、分割模型 mask mAP，各含 `mAP@.5` 与 COCO 风格 `mAP@.50:.95`，并附每类 AP@.5。
+
+实现要点（`internal/`）：
+- `dataset/` 解析 YOLO det（5 列）/ seg（多边形）标签，图片用标准库解码，无新依赖
+- `eval/` 框 IoU、多边形扫描线栅格化（掩膜降采样到长边 256 的位集 + popcount）、COCO 风格按类贪心匹配 + 全点插值 AP；匹配和栅格化只做一次，10 个 IoU 阈值共享
+- 引擎无关：任何实现 `Engine` 接口的后端都能接进来
+
+> 定位是回归/冒烟校验，不是中立 benchmark：coco128 是 COCO train2017 子集，官方 nano 权重在其上训练过，指标偏高；且 Go 掩膜双线性采样约定与 ultralytics 略有差异（raw mask IoU≈0.92），mask mAP 系统性低几个点属正常。实测全 128 张与 ultralytics `model.val()` 同参数结果接近（det box mAP@.5 ≈0.55 vs 官方 0.61，seg mask mAP@.5 ≈0.46 vs 官方 0.55）。
+
 ## 测试
 
 ```bash
-make test     # 纯逻辑单测（NMS/letterbox/shape 解析），不需要 ORT .so 也能编译
-make build    # 下载 ORT + 构建
+make test         # 全量单测 + 集成测试（需要 ORT .so；缺模型/数据时自动 skip）
+make test-short   # 跳过 coco128 大数据集集成测试，只跑纯逻辑单测
+make build        # 下载 ORT + 构建服务
 ```
+
+单元测试覆盖：标签解析、框/掩膜 IoU、AP 的完美/全错/假阳性边界。集成测试 [cmd/validate/main_test.go](cmd/validate/main_test.go) 在 coco128-seg 前 16 张上端到端跑两个模型，断言 mAP@.5 不低于回归下限；缺 `.so`/模型/数据时自动 skip。
 
 ## 已知限制
 

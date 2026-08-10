@@ -8,9 +8,11 @@ ORT_VERSION ?= 1.20.0
 ORT_DIR     := third_party/onnxruntime
 ORT_LIB     := $(ORT_DIR)/lib/libonnxruntime.so
 BINARY      := bin/go-infer
+VALIDATE    := bin/validate
 SEG_MODEL   := models/yolov8n-seg.onnx
+COCO128     := testdata/coco128-seg
 
-.PHONY: all build ort run test vet fmt clean tidy
+.PHONY: all build ort run test test-short vet fmt clean tidy validate coco128-seg
 
 all: build
 
@@ -39,11 +41,33 @@ build: ort
 	@echo ">> 构建 $(BINARY)"
 	CGO_ENABLED=1 go build -o $(BINARY) ./cmd/server
 
+$(VALIDATE): ort
+	@echo ">> 构建 $(VALIDATE)"
+	CGO_ENABLED=1 go build -o $(VALIDATE) ./cmd/validate
+
+## 下载 coco128-seg 校验数据集（约 7MB，需要能访问 github）
+$(COCO128):
+	@echo ">> 下载 coco128-seg.zip"
+	mkdir -p testdata
+	curl -L -o testdata/coco128-seg.zip \
+		https://github.com/ultralytics/assets/releases/download/v0.0.0/coco128-seg.zip
+	cd testdata && unzip -q -o coco128-seg.zip && rm coco128-seg.zip
+	@echo ">> 完成: $(COCO128)"
+
+coco128-seg: $(COCO128)
+
+## 在 coco128-seg 上校验检测/分割模型，输出 mAP
+validate: $(VALIDATE) $(COCO128)
+	$(VALIDATE) -data $(COCO128) -split train2017
+
 run: build
 	./bin/go-infer $(ARGS)
 
 test:
 	CGO_ENABLED=1 go test ./...
+
+test-short:
+	CGO_ENABLED=1 go test -short ./...
 
 test-v:
 	CGO_ENABLED=1 go test -v ./...
