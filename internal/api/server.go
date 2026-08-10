@@ -94,6 +94,7 @@ type predictResponse struct {
 	Task       string             `json:"task"`
 	TookMs     int64              `json:"took_ms"`
 	Detections []engine.Detection `json:"detections,omitempty"`
+	Instances  []engine.Instance  `json:"instances,omitempty"`
 }
 
 func (s *Server) handlePredict(w http.ResponseWriter, r *http.Request) {
@@ -135,22 +136,30 @@ func (s *Server) handlePredict(w http.ResponseWriter, r *http.Request) {
 	}
 	took := time.Since(start).Milliseconds()
 
-	// 检测类结果支持可视化
+	// 视觉类结果支持可视化
 	if vis {
-		if dr, ok := res.(*engine.DetectionResult); ok {
-			out := drawBoxes(img, dr.Detections)
-			w.Header().Set("Content-Type", "image/jpeg")
-			w.Header().Set("X-Took-Ms", strconv.FormatInt(took, 10))
-			_ = jpeg.Encode(w, out, &jpeg.Options{Quality: 90})
+		var out image.Image
+		switch r := res.(type) {
+		case *engine.DetectionResult:
+			out = drawBoxes(img, r.Detections)
+		case *engine.SegmentationResult:
+			out = drawInstances(img, r.Instances)
+		default:
+			http.Error(w, "engine "+eng.Name()+" does not support visualization", http.StatusBadRequest)
 			return
 		}
-		http.Error(w, "engine "+eng.Name()+" does not support visualization", http.StatusBadRequest)
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Header().Set("X-Took-Ms", strconv.FormatInt(took, 10))
+		_ = jpeg.Encode(w, out, &jpeg.Options{Quality: 90})
 		return
 	}
 
 	resp := predictResponse{Engine: eng.Name(), Task: string(res.Task()), TookMs: took}
-	if dr, ok := res.(*engine.DetectionResult); ok {
-		resp.Detections = dr.Detections
+	switch r := res.(type) {
+	case *engine.DetectionResult:
+		resp.Detections = r.Detections
+	case *engine.SegmentationResult:
+		resp.Instances = r.Instances
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -279,4 +288,179 @@ func drawLabel(img *image.RGBA, x, y int, text string, c color.Color) {
 		Dot:  fixed.P(x+pad, bgY+pad+fontH-1),
 	}
 	d.DrawString(text)
+}
+
+// ---------- 实例分割可视化 ----------
+
+func drawInstances(src image.Image, insts []engine.Instance) image.Image {
+	b := src.Bounds()
+	canvas, ok := src.(*image.RGBA)
+	if !ok {
+		canvas = image.NewRGBA(b)
+		draw.Draw(canvas, b, src, b.Min, draw.Src)
+	}
+	out := image.NewRGBA(b)
+	draw.Draw(out, b, canvas, b.Min, draw.Src)
+
+	palette := []color.RGBA{
+		{0, 255, 0, 255}, {255, 0, 0, 255}, {0, 255, 255, 255},
+		{255, 255, 0, 255}, {255, 0, 255, 255}, {0, 128, 255, 255},
+	}
+	for _, ins := range insts {
+		c := palette[ins.ClassID%len(palette)]
+		for _, poly := range ins.Mask {
+			fillPolygon(out, poly, color.RGBA{c.R, c.G, c.B, 90})
+			drawPolygon(out, poly, c)
+		}
+		x1, y1, x2, y2 := int(ins.X1), int(ins.Y1), int(ins.X2), int(ins.Y2)
+		drawRect(out, x1, y1, x2, y2, c)
+		label := fmt.Sprintf("%s %.2f", ins.ClassName, ins.Confidence)
+		drawLabel(out, x1, y1, label, c)
+	}
+	return out
+}
+
+// fillPolygon 用扫描线算法填充多边形（半透明覆盖）。
+func fillPolygon(img *image.RGBA, poly []engine.Point, c color.Color) {
+	if len(poly) < 3 {
+		return
+	}
+	bounds := img.Bounds()
+	minY, maxY := int(poly[0].Y), int(poly[0].Y)
+	for _, p := range poly {
+		y := int(p.Y)
+		if y < minY {
+			minY = y
+		}
+		if y > maxY {
+			maxY = y
+		}
+	}
+	if minY < bounds.Min.Y {
+		minY = bounds.Min.Y
+	}
+	if maxY >= bounds.Max.Y {
+		maxY = bounds.Max.Y - 1
+	}
+	cr, cg, cb, ca := c.RGBA()
+	fillA := uint8(ca >> 8)
+	for y := minY; y <= maxY; y++ {
+		// 求扫描线与各边的交点 x。
+		var xs []float32
+		for i := 0; i < len(poly); i++ {
+			a := poly[i]
+			b := poly[(i+1)%len(poly)]
+			ay, by := int(a.Y), int(b.Y)
+			if ay == by {
+				continue
+			}
+			if y >= min(ay, by) && y < max(ay, by) {
+				t := float32(y-ay) / float32(by-ay)
+				xs = append(xs, a.X+t*(b.X-a.X))
+			}
+		}
+		// 交点排序后两两配对填充。
+		for i := 1; i < len(xs); i++ {
+			for j := i; j > 0 && xs[j-1] > xs[j]; j-- {
+				xs[j-1], xs[j] = xs[j], xs[j-1]
+			}
+		}
+		for i := 0; i+1 < len(xs); i += 2 {
+			x1 := int(xs[i])
+			x2 := int(xs[i+1])
+			if x1 < bounds.Min.X {
+				x1 = bounds.Min.X
+			}
+			if x2 >= bounds.Max.X {
+				x2 = bounds.Max.X - 1
+			}
+			for x := x1; x <= x2; x++ {
+				alphaBlend(img, x, y, uint8(cr>>8), uint8(cg>>8), uint8(cb>>8), fillA)
+			}
+		}
+	}
+}
+
+// drawPolygon 连接多边形顶点画边线。
+func drawPolygon(img *image.RGBA, poly []engine.Point, c color.Color) {
+	for i := 0; i < len(poly); i++ {
+		a := poly[i]
+		b := poly[(i+1)%len(poly)]
+		drawLine(img, int(a.X), int(a.Y), int(b.X), int(b.Y), c)
+	}
+}
+
+// drawLine 用 Bresenham 算法画线。
+func drawLine(img *image.RGBA, x0, y0, x1, y1 int, c color.Color) {
+	dx := abs(x1 - x0)
+	dy := -abs(y1 - y0)
+	sx := 1
+	if x0 >= x1 {
+		sx = -1
+	}
+	sy := 1
+	if y0 >= y1 {
+		sy = -1
+	}
+	err := dx + dy
+	bounds := img.Bounds()
+	for {
+		if x0 >= bounds.Min.X && x0 < bounds.Max.X && y0 >= bounds.Min.Y && y0 < bounds.Max.Y {
+			img.Set(x0, y0, c)
+		}
+		if x0 == x1 && y0 == y1 {
+			break
+		}
+		e2 := 2 * err
+		if e2 >= dy {
+			err += dy
+			x0 += sx
+		}
+		if e2 <= dx {
+			err += dx
+			y0 += sy
+		}
+	}
+}
+
+// alphaBlend 将 (r,g,b,a) 以 source-over 混合到 img 的 (x,y)。
+func alphaBlend(img *image.RGBA, x, y int, r, g, b, a uint8) {
+	i := img.PixOffset(x, y)
+	if i < 0 {
+		return
+	}
+	dst := img.Pix[i : i+4 : i+4]
+	sa := uint32(a)
+	da := uint32(dst[3])
+	oa := sa + (da*(255-sa))/255 // 输出 alpha
+	if oa == 0 {
+		return
+	}
+	blend := func(s, d uint32) uint8 {
+		// (s*sa/255 + d*da/255*(1-sa/255)) / (oa/255)
+		return uint8((s*sa*255 + d*da*(255-sa)) / (oa * 255))
+	}
+	dst[0] = blend(uint32(r), uint32(dst[0]))
+	dst[1] = blend(uint32(g), uint32(dst[1]))
+	dst[2] = blend(uint32(b), uint32(dst[2]))
+	dst[3] = uint8(oa)
+}
+
+func abs(a int) int {
+	if a < 0 {
+		return -a
+	}
+	return a
+}
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

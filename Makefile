@@ -8,6 +8,7 @@ ORT_VERSION ?= 1.20.0
 ORT_DIR     := third_party/onnxruntime
 ORT_LIB     := $(ORT_DIR)/lib/libonnxruntime.so
 BINARY      := bin/go-infer
+SEG_MODEL   := models/yolov8n-seg.onnx
 
 .PHONY: all build ort run test vet fmt clean tidy
 
@@ -26,6 +27,14 @@ $(ORT_LIB):
 
 ort: $(ORT_LIB)
 
+## 下载官方 yolov8n-seg.onnx 案例模型（约 6.7MB，需要能访问 github）
+$(SEG_MODEL):
+	@echo ">> 下载 yolov8n-seg.onnx"
+	curl -L -o $(SEG_MODEL) \
+		https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8n-seg.onnx
+
+seg-model: $(SEG_MODEL)
+
 build: ort
 	@echo ">> 构建 $(BINARY)"
 	CGO_ENABLED=1 go build -o $(BINARY) ./cmd/server
@@ -34,7 +43,10 @@ run: build
 	./bin/go-infer $(ARGS)
 
 test:
-	go test ./...
+	CGO_ENABLED=1 go test ./...
+
+test-v:
+	CGO_ENABLED=1 go test -v ./...
 
 vet:
 	go vet ./...

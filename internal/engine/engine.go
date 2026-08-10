@@ -34,6 +34,28 @@ type Detection struct {
 	Y2         float32 `json:"y2"`
 }
 
+// Point 是轮廓/掩膜上的一个点，坐标已映射回原图。
+type Point struct {
+	X float32 `json:"x"`
+	Y float32 `json:"y"`
+}
+
+// Instance 是实例分割/旋转框等"带形状"任务的一个结果：
+// 框 + 类别 + 置信度 + 外轮廓多边形（闭合点列）。
+type Instance struct {
+	Detection
+	Mask [][]Point `json:"mask,omitempty"` // 外轮廓，可能多个（含洞或断开区域）
+}
+
+// SegmentationResult 是实例分割任务的结果载体。
+type SegmentationResult struct {
+	Elapsed   time.Duration
+	Instances []Instance
+}
+
+func (r *SegmentationResult) Task() Task             { return TaskSegmentation }
+func (r *SegmentationResult) Latency() time.Duration { return r.Elapsed }
+
 // Request 是一次推理请求。不同 Task 使用不同字段：
 //   - 视觉任务（检测/分类/分割/姿态）：Image
 //   - 生成任务：Text（prompt）

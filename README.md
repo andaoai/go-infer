@@ -14,7 +14,8 @@
             ├─────────────────────────────┤
             │  internal/engine  (抽象接口)  │  Engine/Request/Result
             ├─────────────────────────────┤
-            │ engines/onnxruntime/detect   │  ← 已有
+            │ engines/onnxruntime/detect   │  ← 已有（检测）
+            │ engines/onnxruntime/seg      │  ← 已有（实例分割）
             │ engines/tensorrt/detect      │  ← 待加
             │ engines/ncnn/...             │  ← 待加
             │ engines/llamacpp/generate    │  ← 待加（流式）
@@ -39,7 +40,8 @@
 
 **算法任务（Task）**
 - ✅ 目标检测（YOLO 系列，当前）
-- ⬜ 图像分类、旋转框检测、实例分割、姿态估计
+- ✅ 实例分割（YOLOv8-seg，输出框 + 掩膜多边形）
+- ⬜ 图像分类、旋转框检测、姿态估计
 - ⬜ OCR、SAM、CLIP 等视觉模型
 - ⬜ LLM/VLM 流式生成（SSE/WebSocket token 流）
 - ⬜ 多阶段 pipeline（T1 整图检测 → 裁切 → T2 小图二次检测，对齐已有业务）
@@ -61,13 +63,42 @@
 - letterbox 坐标自动还原回原图并 clamp
 - 共享张量串行推理，`conf` 阈值支持按请求覆盖
 
+### 实例分割引擎（YOLOv8-seg）
+
+第二个引擎，与检测引擎平行，挂载为 `?engine=yolov8n-seg`。适配 ultralytics 导出的 YOLOv8-seg ONNX：
+
+- 输入同检测：`float32[1,3,H,W]` NCHW letterbox
+- **两个输出**：检测头 `[1,4+nc+nm,anchors]`（`nm` 掩膜系数维度，通常 32）+ 原型掩膜 `[1,nm,160,160]`
+- 每个保留实例的掩膜 = `sigmoid(系数 · 原型)`，双线性采样、按检测框裁切、`-mask-thr`（默认 0.5）二值化
+- 用 Moore 邻域追踪外轮廓，RDP 算法压缩点数，经 letterbox 映射回原图，以多边形点列返回
+- 模型文件不存在时**自动跳过**，不影响检测服务；用 `-no-seg` 显式关闭
+
+```bash
+# 导出/获取 yolov8n-seg.onnx 放到 models/ 后启动即自动注册
+./bin/go-infer
+# 或显式指定
+./bin/go-infer -seg-name my-seg -seg-model models/best-seg.onnx -mask-thr 0.5
+
+# JSON：每个实例含框 + mask 多边形
+curl -X POST -F "file=@examples/bus.jpg" \
+  "http://localhost:8080/predict?engine=yolov8n-seg&conf=0.5"
+
+# 可视化：半透明填充 + 多边形轮廓 + 框
+curl -X POST -F "file=@examples/bus.jpg" \
+  "http://localhost:8080/predict?engine=yolov8n-seg&conf=0.5&vis=1" \
+  -o seg.jpg
+```
+
 ## 快速开始
 
 ```bash
 # 1. 下载 ONNX Runtime 1.20.0 到 third_party/ + 构建
 make build
 
-# 2. 启动（仓库已附带官方 yolov8n 权重与 COCO 80 类名）
+# 可选：下载官方 yolov8n-seg.onnx 案例模型（需要能访问 github）
+make seg-model
+
+# 2. 启动（仓库已附带官方 yolov8n 权重与 COCO 80 类名；seg 模型存在则自动注册）
 ./bin/go-infer
 # 等价于：
 # ./bin/go-infer -model models/yolov8n.onnx -classes-file models/coco.names \
@@ -93,7 +124,7 @@ curl -X POST -F "file=@examples/bus.jpg" \
   -o out.jpg
 ```
 
-仓库附官方权重 [models/yolov8n.onnx](models/yolov8n.onnx)、类名 [models/coco.names](models/coco.names)、测试图 [examples/bus.jpg](examples/bus.jpg)，以及参考输出 [examples/bus_result.jpg](examples/bus_result.jpg)（3 person + 1 bus，约 39ms）。
+仓库附官方权重 [models/yolov8n.onnx](models/yolov8n.onnx)、类名 [models/coco.names](models/coco.names)、测试图 [examples/bus.jpg](examples/bus.jpg)，以及参考输出 [examples/bus_result.jpg](examples/bus_result.jpg)（检测，约 39ms）。分割参考输出见 [examples/bus_seg_result.jpg](examples/bus_seg_result.jpg)。
 
 ### 用自己的模型
 
@@ -137,8 +168,12 @@ JSON 响应：
 
 | 参数 | 说明 | 默认 |
 |------|------|------|
-| `-name` | 引擎实例名（`?engine=` 选择） | `yolov8n` |
-| `-model` | ONNX 模型路径 | `models/yolov8n.onnx` |
+| `-name` | 检测引擎实例名（`?engine=` 选择） | `yolov8n` |
+| `-model` | 检测 ONNX 模型路径 | `models/yolov8n.onnx` |
+| `-seg-name` | 分割引擎实例名 | `yolov8n-seg` |
+| `-seg-model` | 分割 ONNX 模型路径；文件不存在则跳过 | `models/yolov8n-seg.onnx` |
+| `-no-seg` | 禁用分割引擎（即使模型存在） | false |
+| `-mask-thr` | 分割掩膜二值化阈值 | 0.5 |
 | `-classes` | 类别名，逗号分隔 | 看 `-classes-file` |
 | `-classes-file` | 类别名文件，一行一个 | `models/coco.names` |
 | `-nc` | 类别数（前两者都没给时用） | 1 |
@@ -158,7 +193,9 @@ go-infer/
 │   ├── api/                        HTTP 层，只依赖 engine 接口
 │   ├── preprocess/                 可复用视觉工具：letterbox/缩放/NCHW
 │   └── engines/
-│       └── onnxruntime/detect/     第一个引擎：ORT + YOLO 检测
+│       └── onnxruntime/
+│           ├── detect/             ORT + YOLO 检测引擎
+│           └── seg/                ORT + YOLOv8-seg 实例分割引擎
 ├── models/                         模型权重与类名（yolov8n 为案例）
 ├── examples/                       bus.jpg 与参考结果图
 ├── third_party/onnxruntime/        make ort 下载位置（gitignored）
