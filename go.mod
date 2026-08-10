@@ -1,4 +1,4 @@
-module github.com/andaoai/yolo-onnx-go
+module github.com/andaoai/go-infer
 
 go 1.25.0
 

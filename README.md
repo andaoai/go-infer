@@ -1,122 +1,147 @@
-# yolo-onnx-go
+# go-infer
 
-使用 Go 语言 + ONNX Runtime 进行 YOLO 模型推理的 HTTP 服务。单模型检测，对齐 ultralytics 导出的 ONNX 检测模型。
+以 **Go 高并发为中心**的多框架、多算法推理服务。在各种机器（x86 服务器 / ARM 工控机 / 带 GPU 的工作站 / 半受信边缘节点）上完成推理任务，**不绑定具体算法，也不绑定具体推理框架**。
 
-## 特性
+> 当前状态：第一个引擎已落地——ONNX Runtime + YOLO 检测。架构已经按"可插拔引擎"搭好，后续加后端/算法只新增 `internal/engines/<框架>/<任务>/`，不动 HTTP 与调度层。
 
-- **纯 Go 推理逻辑**：letterbox 预处理、NCHW 归一化、NMS 后处理全部 Go 实现
-- **兼容官方导出**：自动识别 `[1, 4+nc, anchors]`（默认）与 `[1, anchors, 4+nc]`（转置）两种输出排布
-- **自动读取模型元数据**：输入/输出名、输出形状从 ONNX 模型解析，无需手写
-- **letterbox 坐标还原**：检测框映射回原图坐标并 clamp
-- **HTTP API**：`/health`、`/predict`（JSON 或可视化图片）
-- **并发安全**：共享张量串行推理，`conf` 阈值支持按请求覆盖
+## 设计理念
 
-## 依赖说明
+```
+            ┌─────────────────────────────┐
+  HTTP/SSE  │  internal/api   (路由/可视化) │  只依赖 engine 接口
+ ─────────► │  internal/sched (worker pool/ │  ← 高并发探索在这里
+            │                 batching)    │
+            ├─────────────────────────────┤
+            │  internal/engine  (抽象接口)  │  Engine/Request/Result
+            ├─────────────────────────────┤
+            │ engines/onnxruntime/detect   │  ← 已有
+            │ engines/tensorrt/detect      │  ← 待加
+            │ engines/ncnn/...             │  ← 待加
+            │ engines/llamacpp/generate    │  ← 待加（流式）
+            └─────────────────────────────┘
+```
 
-本项目与 wfmon 不同，**不是纯静态二进制**：onnxruntime_go 通过 CGO 绑定 ONNX Runtime，运行时需要 `libonnxruntime.so`。
+- **算法无关**：`Engine` 接口用 `Task` 区分检测/分类/分割/姿态/生成，结果按任务类型返回
+- **框架无关**：ONNX Runtime 只是第一个 `Framework()`；TensorRT/NCNN/OpenVINO/CoreML/llama.cpp 都是平行实现
+- **机器无关**：通过编译标签、执行提供者（EP）、纯 Go 后端等方式适配不同硬件，目标是"一条命令在目标机上跑起来"
+- **并发为核心**：Go 的 goroutine + channel 天然适合 preprocess/infer/postprocess 流水线、攒批（dynamic batching）、多模型并行、流式输出
 
-`make ort` 会自动下载 ONNX Runtime 1.20.0 到 `third_party/`（不污染系统目录），程序启动时按以下顺序查找：
+## 引擎路线图
 
-1. 命令行 `-ort-lib` 指定路径
-2. `third_party/onnxruntime/lib/`
-3. `LD_LIBRARY_PATH`
-4. `/usr/lib`、`/usr/local/lib` 等系统路径
+**推理后端（Framework）**
+- ✅ ONNX Runtime（CPU，当前）—— 跨平台、模型生态最广
+- ⬜ ONNX Runtime Execution Providers：CUDA / TensorRT / CoreML / OpenVINO / DirectML（一个后端覆盖多硬件）
+- ⬜ TensorRT（NVIDIA，FP16/INT8 极致吞吐）
+- ⬜ NCNN / MNN（ARM/端侧，无 C++ 运行时依赖，趋近单二进制）
+- ⬜ OpenVINO（Intel CPU/iGPU）
+- ⬜ llama.cpp / gguf（LLM/VLM 流式生成）
+- ⬜ 纯 Go 路径（gorgonia 等）—— 换回 wfmon 式无动态库部署
+
+**算法任务（Task）**
+- ✅ 目标检测（YOLO 系列，当前）
+- ⬜ 图像分类、旋转框检测、实例分割、姿态估计
+- ⬜ OCR、SAM、CLIP 等视觉模型
+- ⬜ LLM/VLM 流式生成（SSE/WebSocket token 流）
+- ⬜ 多阶段 pipeline（T1 整图检测 → 裁切 → T2 小图二次检测，对齐已有业务）
+
+**高并发探索方向（`internal/sched`，待建）**
+- worker pool：N 个推理 worker 消费请求队列，背压控制
+- dynamic batching：在延迟预算内把多个请求攒成一个 batch 喂给模型
+- 流水线并行：preprocess（CPU）与 infer（GPU/设备）解耦，重叠执行
+- 多引擎路由：按 `?engine=name` 分发，支持同模型多后端 A/B
+- 跨机器调度：与 EasyTier 组网联动，把任务调度到有 GPU 的节点
+- 流式：生成类任务 SSE/WebSocket 边推理边吐 token
+
+## 当前引擎：ONNX Runtime YOLO 检测
+
+适配 ultralytics 导出的 ONNX 检测模型：
+- 输入 `float32[1,3,H,W]`，NCHW，letterbox 等比缩放（填充 114），像素归一化 0~1
+- 输出自动识别官方 `[1,4+nc,anchors]` 与转置 `[1,anchors,4+nc]` 两种排布
+- 从 ONNX 模型元数据读取真实输入/输出名与输出形状，无需手写
+- letterbox 坐标自动还原回原图并 clamp
+- 共享张量串行推理，`conf` 阈值支持按请求覆盖
 
 ## 快速开始
 
 ```bash
-# 1. 下载 ONNX Runtime + 构建
+# 1. 下载 ONNX Runtime 1.20.0 到 third_party/ + 构建
 make build
 
-# 2. 放模型
-cp /path/to/your/best.onnx models/best.onnx
-
-# 3. 启动（类别名逗号分隔；或用 -nc 指定类别数生成默认名）
-./bin/yolo-server \
-  -model models/best.onnx \
-  -classes "person,car,dog" \
-  -imgsz 640 \
-  -conf 0.25 \
-  -addr :8080
+# 2. 启动（仓库已附带官方 yolov8n 权重与 COCO 80 类名）
+./bin/go-infer
+# 等价于：
+# ./bin/go-infer -model models/yolov8n.onnx -classes-file models/coco.names \
+#                -imgsz 640 -conf 0.25 -addr :8080
 ```
 
-### 案例：官方 yolov8n + bus.jpg
-
-仓库已附带官方权重 [models/yolov8n.onnx](models/yolov8n.onnx)、COCO 80 类名 [models/coco.names](models/coco.names) 和测试图 [examples/bus.jpg](examples/bus.jpg)，可直接跑：
+### 验证
 
 ```bash
-# 启动服务
-./bin/yolo-server -model models/yolov8n.onnx -classes-file models/coco.names
+# 健康检查
+curl http://localhost:8080/health
 
-# 另开一个终端：JSON 结果
-curl -X POST -F "file=@examples/bus.jpg" "http://localhost:8080/predict?conf=0.5"
+# 列出已注册引擎
+curl http://localhost:8080/engines
 
-# 或生成画框结果图
-curl -X POST -F "file=@examples/bus.jpg" "http://localhost:8080/predict?conf=0.5&vis=1" -o out.jpg
+# JSON 检测结果
+curl -X POST -F "file=@examples/bus.jpg" \
+  "http://localhost:8080/predict?conf=0.5"
+
+# 生成画框结果图
+curl -X POST -F "file=@examples/bus.jpg" \
+  "http://localhost:8080/predict?conf=0.5&vis=1" \
+  -o out.jpg
 ```
 
-预期输出 3 个 person + 1 个 bus，参考效果见 [examples/bus_result.jpg](examples/bus_result.jpg)。
+仓库附官方权重 [models/yolov8n.onnx](models/yolov8n.onnx)、类名 [models/coco.names](models/coco.names)、测试图 [examples/bus.jpg](examples/bus.jpg)，以及参考输出 [examples/bus_result.jpg](examples/bus_result.jpg)（3 person + 1 bus，约 39ms）。
 
-## API
+### 用自己的模型
 
-### `GET /health`
-
-健康检查。
-
-```json
-{"status": "ok"}
+```python
+# ultralytics 导出
+from ultralytics import YOLO
+YOLO("best.pt").export(format="onnx", imgsz=640, opset=12, simplify=True)
 ```
 
-### `POST /predict`
+```bash
+./bin/go-infer -name my-model -model models/best.onnx \
+  -classes-file models/my.names -imgsz 640
+```
 
-上传图片做检测。支持两种提交方式：
+> 注意：`-imgsz` 必须与导出一致；类别数必须与模型输出的 `4+nc` 匹配，否则启动报错。
 
-- `multipart/form-data`，字段名 `file` 或 `image`
-- 原始请求体（Content-Type 为 image/jpeg、image/png 等）
+## HTTP API
 
-**Query 参数：**
-
-| 参数 | 说明 | 默认 |
+| 方法 | 路径 | 说明 |
 |------|------|------|
-| `conf` | 本次请求的置信度阈值（不影响服务默认值） | 服务启动的 `-conf` |
-| `vis` | 设为 `1` 时返回画好框的 JPEG 图片 | 关 |
+| GET | `/health` | 健康检查，返回已注册引擎数 |
+| GET | `/engines` | 列出所有引擎（name/task/framework） |
+| POST | `/predict` | 推理，`?engine=` 选引擎（默认第一个），`?conf=` 覆盖阈值，`?vis=1` 返回画框 JPEG |
 
-**JSON 响应：**
+`/predict` 提交方式：`multipart/form-data`（字段 `file` 或 `image`）或原始请求体（image/* ）。
 
-```bash
-curl -X POST -F "file=@test.jpg" "http://localhost:8080/predict?conf=0.5"
-```
-
+JSON 响应：
 ```json
 {
+  "engine": "yolov8n",
+  "task": "detection",
   "took_ms": 39,
-  "count": 4,
   "detections": [
-    {
-      "class_id": 0,
-      "class_name": "person",
-      "confidence": 0.89,
-      "x1": 671.0, "y1": 384.4,
-      "x2": 810.0, "y2": 880.2
-    }
+    {"class_id": 0, "class_name": "person", "confidence": 0.89,
+     "x1": 671.0, "y1": 384.4, "x2": 810.0, "y2": 880.2}
   ]
 }
-```
-
-**可视化响应：**
-
-```bash
-curl -X POST -F "file=@test.jpg" "http://localhost:8080/predict?conf=0.5&vis=1" -o out.jpg
 ```
 
 ## 命令行参数
 
 | 参数 | 说明 | 默认 |
 |------|------|------|
-| `-model` | ONNX 模型路径 | `models/best.onnx` |
-| `-classes` | 类别名，逗号分隔 | 按 `-classes-file` 或 `-nc` |
-| `-classes-file` | 类别名文件，一行一个 | 空 |
-| `-nc` | 类别数（前两者均未提供时用） | 1 |
+| `-name` | 引擎实例名（`?engine=` 选择） | `yolov8n` |
+| `-model` | ONNX 模型路径 | `models/yolov8n.onnx` |
+| `-classes` | 类别名，逗号分隔 | 看 `-classes-file` |
+| `-classes-file` | 类别名文件，一行一个 | `models/coco.names` |
+| `-nc` | 类别数（前两者都没给时用） | 1 |
 | `-imgsz` | 模型输入尺寸（正方形） | 640 |
 | `-conf` | 默认置信度阈值 | 0.25 |
 | `-iou` | NMS IoU 阈值 | 0.45 |
@@ -126,44 +151,50 @@ curl -X POST -F "file=@test.jpg" "http://localhost:8080/predict?conf=0.5&vis=1" 
 ## 项目结构
 
 ```
-yolo-onnx-go/
-├── cmd/server/main.go        # 入口：参数解析、ORT 初始化、HTTP 启动
+go-infer/
+├── cmd/server/main.go              入口：加载 ORT、注册引擎、启动 HTTP
 ├── internal/
-│   ├── detector/             # 模型加载/预处理/推理/后处理（NMS）
-│   │   ├── detector.go       # ONNX session、Predict、输出解析
-│   │   ├── preprocess.go     # letterbox、双线性缩放、NCHW 归一化
-│   │   └── detector_test.go  # 纯 Go 逻辑单测
-│   └── api/                  # HTTP handler 与可视化
-│       └── server.go
-├── models/                   # 放 .onnx 模型（gitignored）
-├── third_party/onnxruntime/  # make ort 下载位置（gitignored）
+│   ├── engine/                     引擎无关抽象：Engine/Request/Result/Task
+│   ├── api/                        HTTP 层，只依赖 engine 接口
+│   ├── preprocess/                 可复用视觉工具：letterbox/缩放/NCHW
+│   └── engines/
+│       └── onnxruntime/detect/     第一个引擎：ORT + YOLO 检测
+├── models/                         模型权重与类名（yolov8n 为案例）
+├── examples/                       bus.jpg 与参考结果图
+├── third_party/onnxruntime/        make ort 下载位置（gitignored）
 ├── Makefile
 └── go.mod
 ```
 
-## 导出模型（ultralytics）
+## 加一个新引擎
 
-```python
-from ultralytics import YOLO
-model = YOLO("best.pt")
-model.export(format="onnx", imgsz=640, opset=12, simplify=True)
+实现 [internal/engine/engine.go](internal/engine/engine.go) 的 `Engine` 接口即可：
+
+```go
+type Engine interface {
+    Name() string
+    Task() engine.Task
+    Framework() string
+    Run(ctx context.Context, req *engine.Request) (engine.Result, error)
+    Close() error
+}
 ```
 
-> 注意：`-imgsz` 必须与导出时一致；输出锚点数由模型形状决定（640 输入通常为 8400）。
+然后在 [cmd/server/main.go](cmd/server/main.go) 里 `srv.Register(myEngine)`。检测类任务返回 `*engine.DetectionResult` 即可自动复用 HTTP 可视化；新任务类型可在 `engine` 包加对应的 `Result` 实现，并在 api 层加渲染。
+
+## 依赖说明
+
+当前 ONNX Runtime 引擎经 CGO 绑定，运行时需要 `libonnxruntime.so`，**不是纯静态二进制**（这一点与 wfmon 不同；端侧/纯 Go 后端是后续探索方向）。`make ort` 自动下载 ORT 1.20.0 到 `third_party/`，程序按 `-ort-lib` → `third_party/` → `LD_LIBRARY_PATH` → 系统路径顺序查找。
 
 ## 测试
 
 ```bash
-# 纯逻辑单测（不需要 ONNX Runtime .so 也能编译运行）
-go test ./...
-
-# 完整构建
-make build
+make test     # 纯逻辑单测（NMS/letterbox/shape 解析），不需要 ORT .so 也能编译
+make build    # 下载 ORT + 构建
 ```
 
 ## 已知限制
 
-- 输入尺寸固定（启动时指定），不支持动态输入尺寸
-- 不支持动态输出维度（`-1`），需导出为固定 shape
-- 可视化标签使用 Go 内置点阵字体，仅支持 ASCII；中文类别名会显示为方块（JSON 返回不受影响）
-- 单实例串行推理；如需更高吞吐可运行多实例前置负载均衡
+- 输入尺寸固定（启动时指定），不支持动态输入尺寸；输出维度不支持 `-1`
+- 可视化标签用 Go 内置点阵字体，仅支持 ASCII（中文类别名显示为方块，JSON 不受影响）
+- 单引擎实例共享张量、推理串行；高并发/攒批能力在 `internal/sched` 规划中，尚未实现

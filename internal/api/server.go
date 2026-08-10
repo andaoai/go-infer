@@ -1,4 +1,7 @@
-// Package api 提供 YOLO 推理的 HTTP 服务。
+// Package api 提供推理服务的 HTTP 层。
+//
+// 不感知具体推理框架，只依赖 engine.Engine 接口；可同时挂载多个引擎，
+// 通过 ?engine=<name> 选择。检测类结果支持 vis=1 可视化。
 package api
 
 import (
@@ -17,41 +20,80 @@ import (
 	"strings"
 	"time"
 
-	"github.com/andaoai/yolo-onnx-go/internal/detector"
+	"github.com/andaoai/go-infer/internal/engine"
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/basicfont"
 	"golang.org/x/image/math/fixed"
 )
 
-// Server 持有检测器并注册路由。
+// Server 持有已注册引擎并路由请求。
 type Server struct {
-	det *detector.Detector
-	mux *http.ServeMux
+	engines map[string]engine.Engine
+	order   []string // 保持注册顺序，第一个为默认
+	mux     *http.ServeMux
 }
 
-func NewServer(det *detector.Detector) *Server {
-	s := &Server{det: det, mux: http.NewServeMux()}
+func NewServer() *Server {
+	s := &Server{engines: make(map[string]engine.Engine), mux: http.NewServeMux()}
 	s.routes()
 	return s
 }
 
+// Register 挂载一个引擎。
+func (s *Server) Register(e engine.Engine) {
+	name := e.Name()
+	if _, exists := s.engines[name]; !exists {
+		s.order = append(s.order, name)
+	}
+	s.engines[name] = e
+}
+
 func (s *Server) routes() {
 	s.mux.HandleFunc("/health", s.handleHealth)
+	s.mux.HandleFunc("/engines", s.handleEngines)
 	s.mux.HandleFunc("/predict", s.handlePredict)
 }
 
-func (s *Server) Handler() http.Handler {
-	return logging(s.mux)
+func (s *Server) Handler() http.Handler { return logging(s.mux) }
+
+func (s *Server) resolve(name string) (engine.Engine, error) {
+	if name != "" {
+		e, ok := s.engines[name]
+		if !ok {
+			return nil, fmt.Errorf("engine %q not found", name)
+		}
+		return e, nil
+	}
+	if len(s.order) == 0 {
+		return nil, fmt.Errorf("no engine registered")
+	}
+	return s.engines[s.order[0]], nil
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "engines": len(s.engines)})
+}
+
+type engineInfo struct {
+	Name      string `json:"name"`
+	Task      string `json:"task"`
+	Framework string `json:"framework"`
+}
+
+func (s *Server) handleEngines(w http.ResponseWriter, r *http.Request) {
+	infos := make([]engineInfo, 0, len(s.order))
+	for _, name := range s.order {
+		e := s.engines[name]
+		infos = append(infos, engineInfo{Name: name, Task: string(e.Task()), Framework: e.Framework()})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"count": len(infos), "engines": infos})
 }
 
 type predictResponse struct {
-	TookMs     int64                `json:"took_ms"`
-	Count      int                  `json:"count"`
-	Detections []detector.Detection `json:"detections"`
+	Engine     string             `json:"engine"`
+	Task       string             `json:"task"`
+	TookMs     int64              `json:"took_ms"`
+	Detections []engine.Detection `json:"detections,omitempty"`
 }
 
 func (s *Server) handlePredict(w http.ResponseWriter, r *http.Request) {
@@ -59,76 +101,92 @@ func (s *Server) handlePredict(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	confThresh := parseFloatDefault(r.URL.Query().Get("conf"), 0)
-	// 可视化参数: vis=1 返回标注后的图片
+	engName := r.URL.Query().Get("engine")
 	vis := r.URL.Query().Get("vis") == "1"
+	var conf float32
+	if v := r.URL.Query().Get("conf"); v != "" {
+		if f, err := strconv.ParseFloat(v, 32); err == nil {
+			conf = float32(f)
+		}
+	}
 
-	imgBytes, err := readImageBytes(r)
+	img, _, err := readImage(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	img, _, err := image.Decode(bytes.NewReader(imgBytes))
+
+	eng, err := s.resolve(engName)
 	if err != nil {
-		http.Error(w, "decode image: "+err.Error(), http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
 
-	start := time.Now()
-	predOpts := []detector.Option(nil)
-	if confThresh > 0 {
-		predOpts = append(predOpts, detector.WithConfThresh(confThresh))
+	req := &engine.Request{Image: img}
+	if conf > 0 {
+		req.Params = map[string]float32{"conf": conf}
 	}
-	dets, err := s.det.Predict(img, predOpts...)
+
+	start := time.Now()
+	res, err := eng.Run(r.Context(), req)
 	if err != nil {
 		http.Error(w, "inference: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	took := time.Since(start).Milliseconds()
 
+	// 检测类结果支持可视化
 	if vis {
-		boxed := drawBoxes(img, dets)
-		w.Header().Set("Content-Type", "image/jpeg")
-		w.Header().Set("X-Took-Ms", strconv.FormatInt(took, 10))
-		_ = jpeg.Encode(w, boxed, &jpeg.Options{Quality: 90})
+		if dr, ok := res.(*engine.DetectionResult); ok {
+			out := drawBoxes(img, dr.Detections)
+			w.Header().Set("Content-Type", "image/jpeg")
+			w.Header().Set("X-Took-Ms", strconv.FormatInt(took, 10))
+			_ = jpeg.Encode(w, out, &jpeg.Options{Quality: 90})
+			return
+		}
+		http.Error(w, "engine "+eng.Name()+" does not support visualization", http.StatusBadRequest)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, predictResponse{
-		TookMs:     took,
-		Count:      len(dets),
-		Detections: dets,
-	})
+	resp := predictResponse{Engine: eng.Name(), Task: string(res.Task()), TookMs: took}
+	if dr, ok := res.(*engine.DetectionResult); ok {
+		resp.Detections = dr.Detections
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
-// readImageBytes 支持 multipart 上传（字段名 file/image）或原始请求体。
-func readImageBytes(r *http.Request) ([]byte, error) {
+// readImage 支持 multipart（字段 file/image）或原始请求体。
+func readImage(r *http.Request) (image.Image, []byte, error) {
+	var data []byte
+	var err error
 	ct := r.Header.Get("Content-Type")
 	if strings.HasPrefix(ct, "multipart/form-data") {
-		if err := r.ParseMultipartForm(32 << 20); err != nil {
-			return nil, fmt.Errorf("parse multipart: %w", err)
+		if e := r.ParseMultipartForm(32 << 20); e != nil {
+			return nil, nil, fmt.Errorf("parse multipart: %w", e)
 		}
 		for _, field := range []string{"file", "image"} {
-			f, _, err := r.FormFile(field)
-			if err == nil {
+			f, _, e := r.FormFile(field)
+			if e == nil {
 				defer f.Close()
-				return io.ReadAll(f)
+				data, err = io.ReadAll(f)
+				break
 			}
 		}
-		return nil, fmt.Errorf("multipart: missing 'file' or 'image' field")
+		if data == nil {
+			return nil, nil, fmt.Errorf("multipart: missing 'file' or 'image' field")
+		}
+	} else {
+		defer r.Body.Close()
+		data, err = io.ReadAll(r.Body)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
-	return io.ReadAll(r.Body)
-}
-
-func parseFloatDefault(s string, def float32) float32 {
-	if s == "" {
-		return def
-	}
-	v, err := strconv.ParseFloat(s, 32)
+	img, _, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
-		return def
+		return nil, nil, fmt.Errorf("decode image: %w", err)
 	}
-	return float32(v)
+	return img, data, nil
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -137,7 +195,6 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// logging 是一个最小的访问日志中间件。
 func logging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -157,17 +214,17 @@ func (s *statusWriter) WriteHeader(c int) {
 	s.ResponseWriter.WriteHeader(c)
 }
 
-// drawBoxes 在图上绘制检测框与标签。
-func drawBoxes(src image.Image, dets []detector.Detection) image.Image {
+// ---------- 检测结果可视化 ----------
+
+func drawBoxes(src image.Image, dets []engine.Detection) image.Image {
 	b := src.Bounds()
-	rgba, ok := src.(*image.RGBA)
+	canvas, ok := src.(*image.RGBA)
 	if !ok {
-		rgba = image.NewRGBA(b)
-		draw.Draw(rgba, b, src, b.Min, draw.Src)
+		canvas = image.NewRGBA(b)
+		draw.Draw(canvas, b, src, b.Min, draw.Src)
 	}
-	// 复制一份避免改原图
 	out := image.NewRGBA(b)
-	draw.Draw(out, b, rgba, b.Min, draw.Src)
+	draw.Draw(out, b, canvas, b.Min, draw.Src)
 
 	palette := []color.RGBA{
 		{0, 255, 0, 255}, {255, 0, 0, 255}, {0, 255, 255, 255},
@@ -204,10 +261,8 @@ func drawLabel(img *image.RGBA, x, y int, text string, c color.Color) {
 	bgH := fontH + pad*2
 	bgY := y - bgH
 	if bgY < 0 {
-		bgY = y // 顶部空间不够时画在框内顶部
+		bgY = y
 	}
-
-	// 半透明背景条
 	bounds := img.Bounds()
 	for dy := 0; dy < bgH; dy++ {
 		for dx := 0; dx < bgW; dx++ {
@@ -217,8 +272,6 @@ func drawLabel(img *image.RGBA, x, y int, text string, c color.Color) {
 			}
 		}
 	}
-
-	// 文字（黑色，basicfont 仅支持 ASCII，类别名含中文时显示为方块）
 	d := &font.Drawer{
 		Dst:  img,
 		Src:  image.NewUniform(color.Black),

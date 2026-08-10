@@ -1,4 +1,8 @@
-// Command server 启动 YOLO ONNX 推理 HTTP 服务。
+// Command go-infer 启动推理 HTTP 服务。
+//
+// 它是引擎无关的：所有推理逻辑由实现了 engine.Engine 的具体引擎提供，
+// 本程序只负责加载 ONNX Runtime、按配置构造并注册引擎、启动 HTTP。
+// 当前内置一个 ONNX Runtime YOLO 检测引擎，后续可在此注册更多后端/算法。
 package main
 
 import (
@@ -10,17 +14,19 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/andaoai/yolo-onnx-go/internal/api"
-	"github.com/andaoai/yolo-onnx-go/internal/detector"
-	"github.com/yalue/onnxruntime_go"
+	"github.com/andaoai/go-infer/internal/api"
+	"github.com/andaoai/go-infer/internal/engine"
+	"github.com/andaoai/go-infer/internal/engines/onnxruntime/detect"
+	ort "github.com/yalue/onnxruntime_go"
 )
 
 func main() {
 	var (
-		modelPath   = flag.String("model", "models/best.onnx", "ONNX 模型路径")
-		classes     = flag.String("classes", "", "类别名，逗号分隔（如 person,car）；留空则按 -classes-file 或 -nc")
-		classesFile = flag.String("classes-file", "", "类别名文件路径，一行一个类别名（如 models/coco.names）")
-		numClass    = flag.Int("nc", 0, "类别数；classes 和 classes-file 均未提供时据此生成默认名")
+		name        = flag.String("name", "yolov8n", "引擎实例名（用于 ?engine= 选择）")
+		modelPath   = flag.String("model", "models/yolov8n.onnx", "ONNX 模型路径")
+		classes     = flag.String("classes", "", "类别名，逗号分隔；留空则看 -classes-file")
+		classesFile = flag.String("classes-file", "models/coco.names", "类别名文件，一行一个；空字符串表示不读")
+		numClass    = flag.Int("nc", 0, "类别数（前两者均未提供时用）")
 		imgsz       = flag.Int("imgsz", 640, "模型输入尺寸（正方形）")
 		conf        = flag.Float64("conf", 0.25, "默认置信度阈值")
 		iou         = flag.Float64("iou", 0.45, "NMS IoU 阈值")
@@ -32,29 +38,33 @@ func main() {
 	if err := initONNXRuntime(*ortLib); err != nil {
 		log.Fatalf("初始化 ONNX Runtime: %v", err)
 	}
-	defer onnxruntime_go.DestroyEnvironment()
+	defer ort.DestroyEnvironment()
 
 	classList, err := loadClasses(*classes, *classesFile, *numClass)
 	if err != nil {
 		log.Fatalf("读取类别: %v", err)
 	}
-	cfg := detector.Config{
+
+	eng, err := detect.New(detect.Config{
+		Name:       *name,
 		ModelPath:  *modelPath,
 		InputW:     *imgsz,
 		InputH:     *imgsz,
 		Classes:    classList,
 		ConfThresh: float32(*conf),
 		IoUThresh:  float32(*iou),
-	}
-	det, err := detector.New(cfg)
+	})
 	if err != nil {
-		log.Fatalf("加载模型: %v", err)
+		log.Fatalf("创建引擎 %s: %v", *name, err)
 	}
-	defer det.Close()
+	defer eng.Close()
 
-	srv := api.NewServer(det)
-	log.Printf("YOLO ONNX 服务启动于 %s (model=%s imgsz=%d classes=%d)",
-		*addr, *modelPath, *imgsz, len(cfg.Classes))
+	srv := api.NewServer()
+	srv.Register(eng)
+	// 在此 srv.Register(...) 更多引擎（TensorRT/NCNN/llama.cpp ...）。
+
+	log.Printf("go-infer 服务启动于 %s | 引擎=%s task=%s framework=%s classes=%d",
+		*addr, eng.Name(), eng.Task(), eng.Framework(), len(classList))
 	if err := http.ListenAndServe(*addr, srv.Handler()); err != nil {
 		log.Fatal(err)
 	}
@@ -70,17 +80,15 @@ func initONNXRuntime(explicit string) error {
 		return fmt.Errorf("未找到 libonnxruntime.so，请用 -ort-lib 指定，或执行 `make ort` 下载到 third_party/onnxruntime")
 	}
 	log.Printf("使用 ONNX Runtime: %s", lib)
-	onnxruntime_go.SetSharedLibraryPath(lib)
-	return onnxruntime_go.InitializeEnvironment()
+	ort.SetSharedLibraryPath(lib)
+	return ort.InitializeEnvironment()
 }
 
 // findOrtLib 在常见位置查找 libonnxruntime.so。
 func findOrtLib() string {
-	// 1. 项目内 third_party（make ort 下载位置）
 	if matches, _ := filepath.Glob("third_party/onnxruntime/lib/libonnxruntime.so*"); len(matches) > 0 {
 		return matches[0]
 	}
-	// 2. 环境变量
 	if p := os.Getenv("LD_LIBRARY_PATH"); p != "" {
 		for _, dir := range filepath.SplitList(p) {
 			if matches, _ := filepath.Glob(filepath.Join(dir, "libonnxruntime.so*")); len(matches) > 0 {
@@ -88,7 +96,6 @@ func findOrtLib() string {
 			}
 		}
 	}
-	// 3. 系统标准路径
 	for _, dir := range []string{"/usr/lib", "/usr/local/lib", "/usr/lib/x86_64-linux-gnu"} {
 		if matches, _ := filepath.Glob(filepath.Join(dir, "libonnxruntime.so*")); len(matches) > 0 {
 			return matches[0]
@@ -97,12 +104,11 @@ func findOrtLib() string {
 	return ""
 }
 
-// loadClasses 按优先级解析类别名：-classes 逗号串 > -classes-file 文件 > -nc 默认名。
+// loadClasses 按优先级解析类别名：-classes > -classes-file > -nc 默认名。
 func loadClasses(classes, classesFile string, n int) ([]string, error) {
 	if strings.TrimSpace(classes) != "" {
-		parts := strings.Split(classes, ",")
-		out := make([]string, 0, len(parts))
-		for _, p := range parts {
+		var out []string
+		for _, p := range strings.Split(classes, ",") {
 			if name := strings.TrimSpace(p); name != "" {
 				out = append(out, name)
 			}
@@ -134,3 +140,6 @@ func loadClasses(classes, classesFile string, n int) ([]string, error) {
 	}
 	return out, nil
 }
+
+// 保留 engine 引用以便未来在此文件中引用接口类型。
+var _ engine.Engine = (*detect.Engine)(nil)

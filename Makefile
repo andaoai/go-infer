@@ -1,13 +1,13 @@
-# YOLO ONNX Go 推理服务
+# go-infer：以 Go 高并发为中心的多框架/多算法推理服务
 #
-# 注意：onnxruntime_go 依赖 CGO 与运行时动态库 libonnxruntime.so，
-# 因此本项目不是纯静态二进制（与 wfmon 不同）。
+# 注意：当前 ONNX Runtime 引擎依赖 CGO 与运行时动态库 libonnxruntime.so，
+# 不是纯静态二进制（这与 wfmon 不同；纯 Go/端侧后端是后续探索方向）。
 # `make ort` 会把 ONNX Runtime 下载到 third_party/，不污染系统目录。
 
 ORT_VERSION ?= 1.20.0
 ORT_DIR     := third_party/onnxruntime
 ORT_LIB     := $(ORT_DIR)/lib/libonnxruntime.so
-BINARY      := bin/yolo-server
+BINARY      := bin/go-infer
 
 .PHONY: all build ort run test vet fmt clean tidy
 
@@ -31,7 +31,7 @@ build: ort
 	CGO_ENABLED=1 go build -o $(BINARY) ./cmd/server
 
 run: build
-	./$(BINARY) $(ARGS)
+	./bin/go-infer $(ARGS)
 
 test:
 	go test ./...
