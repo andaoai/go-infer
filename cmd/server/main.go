@@ -10,9 +10,12 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 
 	"github.com/andaoai/go-infer/internal/api"
 	"github.com/andaoai/go-infer/internal/appcfg"
+	"github.com/andaoai/go-infer/internal/capture"
 	"github.com/andaoai/go-infer/internal/engine"
 	"github.com/andaoai/go-infer/internal/engines/onnxruntime/detect"
 	"github.com/andaoai/go-infer/internal/engines/onnxruntime/seg"
@@ -36,6 +39,12 @@ func main() {
 		maskThr     = flag.Float64("mask-thr", 0.5, "分割掩膜二值化阈值")
 		addr        = flag.String("addr", ":8080", "监听地址")
 		ortLib      = flag.String("ort-lib", "", "libonnxruntime.so 路径；留空则自动查找")
+
+		captureDir    = flag.String("capture-dir", "", "推理采集池根目录（如 dataset/pool）；留空则不采集")
+		captureRate   = flag.Float64("capture-rate", 0.1, "普通样本采样概率 0~1；无检测/低置信度样本必存")
+		captureLow    = flag.Float64("capture-low-conf", 0.25, "最高置信度低于该值的不确定样本必存")
+		captureQuota  = flag.String("capture-quota", "5GB", "采集池总容量上限（如 500MB/5GB/0 表示不限）")
+		captureBuffer = flag.Int("capture-buffer", 256, "异步采集队列长度")
 	)
 	flag.Parse()
 
@@ -81,6 +90,16 @@ func main() {
 	}
 	// 在此 srv.Register(...) 更多引擎（TensorRT/NCNN/llama.cpp ...）。
 
+	// 推理采集（原图 + YOLO 伪标签），默认关闭。
+	if rec, err := newCaptureRecorder(*captureDir, *captureRate, float32(*captureLow), *captureQuota, *captureBuffer); err != nil {
+		log.Fatalf("初始化采集器: %v", err)
+	} else if rec != nil {
+		srv.SetRecorder(recAdapter{rec})
+		defer rec.Close()
+		log.Printf("推理采集已开启: dir=%s rate=%.2f low-conf=%.2f quota=%s",
+			*captureDir, *captureRate, *captureLow, *captureQuota)
+	}
+
 	log.Printf("go-infer 服务启动于 %s | 默认引擎=%s task=%s framework=%s classes=%d",
 		*addr, eng.Name(), eng.Task(), eng.Framework(), len(classList))
 	if err := http.ListenAndServe(*addr, srv.Handler()); err != nil {
@@ -114,3 +133,60 @@ var (
 	_ engine.Engine = (*detect.Engine)(nil)
 	_ engine.Engine = (*seg.Engine)(nil)
 )
+
+// newCaptureRecorder 构造采集器；dir 为空返回 nil 表示不采集。
+func newCaptureRecorder(dir string, rate float64, lowConf float32, quota string, buffer int) (*capture.Recorder, error) {
+	if dir == "" {
+		return nil, nil
+	}
+	quotaBytes, err := parseSize(quota)
+	if err != nil {
+		return nil, err
+	}
+	return capture.New(capture.Config{
+		Dir:        dir,
+		Rate:       rate,
+		LowConf:    lowConf,
+		QuotaBytes: quotaBytes,
+		Buffer:     buffer,
+	})
+}
+
+// recAdapter 把 api.CaptureSample 转成 capture.Sample。
+type recAdapter struct{ r *capture.Recorder }
+
+func (a recAdapter) Record(s api.CaptureSample) {
+	a.r.Record(capture.Sample{
+		Engine:     s.Engine,
+		Task:       s.Task,
+		Image:      s.Image,
+		W:          s.W,
+		H:          s.H,
+		ImgExt:     s.ImgExt,
+		Detections: s.Detections,
+		Instances:  s.Instances,
+	})
+}
+
+// parseSize 解析 "500MB"/"5GB"/"1024"/"0" 为字节数。
+func parseSize(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "0" {
+		return 0, nil
+	}
+	mult := int64(1)
+	upper := strings.ToUpper(s)
+	switch {
+	case strings.HasSuffix(upper, "GB"):
+		mult, s = 1<<30, s[:len(s)-2]
+	case strings.HasSuffix(upper, "MB"):
+		mult, s = 1<<20, s[:len(s)-2]
+	case strings.HasSuffix(upper, "KB"):
+		mult, s = 1<<10, s[:len(s)-2]
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return n * mult, nil
+}

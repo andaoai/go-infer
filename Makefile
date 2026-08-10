@@ -9,10 +9,13 @@ ORT_DIR     := third_party/onnxruntime
 ORT_LIB     := $(ORT_DIR)/lib/libonnxruntime.so
 BINARY      := bin/go-infer
 VALIDATE    := bin/validate
+DATASET     := bin/dataset
 SEG_MODEL   := models/yolov8n-seg.onnx
 COCO128     := testdata/coco128-seg
+DATA_ROOT   := dataset
+POOL        := $(DATA_ROOT)/pool
 
-.PHONY: all build ort run test test-short vet fmt clean tidy validate coco128-seg
+.PHONY: all build ort run test test-short vet fmt clean tidy validate coco128-seg dataset promote
 
 all: build
 
@@ -44,6 +47,17 @@ build: ort
 $(VALIDATE): ort
 	@echo ">> 构建 $(VALIDATE)"
 	CGO_ENABLED=1 go build -o $(VALIDATE) ./cmd/validate
+
+$(DATASET):
+	@echo ">> 构建 $(DATASET)"
+	CGO_ENABLED=0 go build -o $(DATASET) ./cmd/dataset
+
+## 数据集工具（纯 Go，不依赖 ORT）
+dataset: $(DATASET)
+
+## 把采集池合并进训练数据集（图片+标签按引擎隔离，生成 data.yaml）
+promote: $(DATASET)
+	$(DATASET) promote --pool $(POOL) --into $(DATA_ROOT) --classes models/coco.names
 
 ## 下载 coco128-seg 校验数据集（约 7MB，需要能访问 github）
 $(COCO128):

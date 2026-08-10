@@ -28,9 +28,10 @@ import (
 
 // Server 持有已注册引擎并路由请求。
 type Server struct {
-	engines map[string]engine.Engine
-	order   []string // 保持注册顺序，第一个为默认
-	mux     *http.ServeMux
+	engines  map[string]engine.Engine
+	order    []string // 保持注册顺序，第一个为默认
+	mux      *http.ServeMux
+	recorder Recorder
 }
 
 func NewServer() *Server {
@@ -38,6 +39,25 @@ func NewServer() *Server {
 	s.routes()
 	return s
 }
+
+// CaptureSample 是一次推理结果的采集输入（引擎无关）。
+type CaptureSample struct {
+	Engine     string
+	Task       engine.Task
+	Image      []byte // 原始上传字节
+	W, H       int
+	ImgExt     string // ".jpg"/".png"
+	Detections []engine.Detection
+	Instances  []engine.Instance
+}
+
+// Recorder 是可选的推理采集器（internal/capture 实现）。
+type Recorder interface {
+	Record(s CaptureSample)
+}
+
+// SetRecorder 挂载采集器；传 nil 关闭采集。
+func (s *Server) SetRecorder(r Recorder) { s.recorder = r }
 
 // Register 挂载一个引擎。
 func (s *Server) Register(e engine.Engine) {
@@ -111,7 +131,7 @@ func (s *Server) handlePredict(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	img, _, err := readImage(r)
+	img, raw, format, err := readImage(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -158,20 +178,45 @@ func (s *Server) handlePredict(w http.ResponseWriter, r *http.Request) {
 	switch r := res.(type) {
 	case *engine.DetectionResult:
 		resp.Detections = r.Detections
+		if s.recorder != nil && !vis {
+			b := img.Bounds()
+			s.recorder.Record(CaptureSample{
+				Engine:     eng.Name(),
+				Task:       res.Task(),
+				Image:      raw,
+				W:          b.Dx(),
+				H:          b.Dy(),
+				ImgExt:     "." + format,
+				Detections: r.Detections,
+			})
+		}
 	case *engine.SegmentationResult:
 		resp.Instances = r.Instances
+		if s.recorder != nil && !vis {
+			b := img.Bounds()
+			s.recorder.Record(CaptureSample{
+				Engine:    eng.Name(),
+				Task:      res.Task(),
+				Image:     raw,
+				W:         b.Dx(),
+				H:         b.Dy(),
+				ImgExt:    "." + format,
+				Instances: r.Instances,
+			})
+		}
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
 // readImage 支持 multipart（字段 file/image）或原始请求体。
-func readImage(r *http.Request) (image.Image, []byte, error) {
+// 返回图片、原始字节与格式（"jpeg"/"png"，由 image.DecodeConfig 探测）。
+func readImage(r *http.Request) (image.Image, []byte, string, error) {
 	var data []byte
 	var err error
 	ct := r.Header.Get("Content-Type")
 	if strings.HasPrefix(ct, "multipart/form-data") {
 		if e := r.ParseMultipartForm(32 << 20); e != nil {
-			return nil, nil, fmt.Errorf("parse multipart: %w", e)
+			return nil, nil, "", fmt.Errorf("parse multipart: %w", e)
 		}
 		for _, field := range []string{"file", "image"} {
 			f, _, e := r.FormFile(field)
@@ -182,20 +227,20 @@ func readImage(r *http.Request) (image.Image, []byte, error) {
 			}
 		}
 		if data == nil {
-			return nil, nil, fmt.Errorf("multipart: missing 'file' or 'image' field")
+			return nil, nil, "", fmt.Errorf("multipart: missing 'file' or 'image' field")
 		}
 	} else {
 		defer r.Body.Close()
 		data, err = io.ReadAll(r.Body)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, "", err
 		}
 	}
-	img, _, err := image.Decode(bytes.NewReader(data))
+	img, format, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
-		return nil, nil, fmt.Errorf("decode image: %w", err)
+		return nil, nil, "", fmt.Errorf("decode image: %w", err)
 	}
-	return img, data, nil
+	return img, data, format, nil
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

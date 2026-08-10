@@ -182,20 +182,24 @@ JSON 响应：
 | `-iou` | NMS IoU 阈值 | 0.45 |
 | `-addr` | 监听地址 | `:8080` |
 | `-ort-lib` | `libonnxruntime.so` 路径 | 自动查找 |
+| `-capture-*` | 推理采集（目录/采样率/低置信/配额），见[闭环章节](#部署--采集--回流闭环) | 默认关闭 |
 
 ## 项目结构
 
 ```
 go-infer/
 ├── cmd/
-│   ├── server/main.go              HTTP 服务入口：加载 ORT、注册引擎、启动服务
-│   └── validate/main.go            数据集校验入口：跑模型、算 mAP
+│   ├── server/main.go              HTTP 服务入口：加载 ORT、注册引擎、启动服务（含采集开关）
+│   ├── validate/main.go            数据集校验入口：跑模型、算 mAP
+│   └── dataset/main.go             数据集回流入口：采集池 → 训练集
 ├── internal/
 │   ├── engine/                     引擎无关抽象：Engine/Request/Result/Task
-│   ├── api/                        HTTP 层，只依赖 engine 接口
-│   ├── dataset/                    YOLO 标签读取（det 5 列 / seg 多边形）
+│   ├── api/                        HTTP 层，只依赖 engine 接口；可选 Recorder 钩子
+│   ├── dataset/                    YOLO 标签读取与写入（det 5 列 / seg 多边形）
 │   ├── eval/                       IoU、栅格化、COCO AP/mAP
-│   ├── appcfg/                     类别名加载（server/validate 共用）
+│   ├── capture/                    推理采集器：策略采样 + 异步落盘 + 配额淘汰
+│   ├── promote/                    采集池按引擎合并进训练集 + 生成 data.yaml
+│   ├── appcfg/                     类别名加载（server/validate/dataset 共用）
 │   ├── ortenv/                     ORT 动态库查找与初始化（共用）
 │   ├── preprocess/                 可复用视觉工具：letterbox/缩放/NCHW
 │   └── engines/
@@ -204,6 +208,7 @@ go-infer/
 │           └── seg/                ORT + YOLOv8-seg 实例分割引擎
 ├── models/                         模型权重与类名（yolov8n 为案例）
 ├── examples/                       bus.jpg 与参考结果图
+├── dataset/                        运行期数据（gitignored）：pool 采集池 / <engine> 训练集 / versions
 ├── testdata/                       coco128-seg 等校验数据集（gitignored）
 ├── third_party/onnxruntime/        make ort 下载位置（gitignored）
 ├── Makefile
@@ -264,6 +269,72 @@ CGO_ENABLED=1 go build -o bin/validate ./cmd/validate
 - 引擎无关：任何实现 `Engine` 接口的后端都能接进来
 
 > 定位是回归/冒烟校验，不是中立 benchmark：coco128 是 COCO train2017 子集，官方 nano 权重在其上训练过，指标偏高；且 Go 掩膜双线性采样约定与 ultralytics 略有差异（raw mask IoU≈0.92），mask mAP 系统性低几个点属正常。实测全 128 张与 ultralytics `model.val()` 同参数结果接近（det box mAP@.5 ≈0.55 vs 官方 0.61，seg mask mAP@.5 ≈0.46 vs 官方 0.55）。
+
+## 部署 → 采集 → 回流闭环
+
+训练好新模型后的标准流程是：导出 ONNX → 用 `cmd/validate` 在固定 test 集上跑 mAP 门禁 → 停服替换模型 → 起服上线。线上推理时按策略把**原图 + YOLO 伪标签**采集下来，审核修正后合并回训练集，交给 Python 侧重训。Go 侧只负责"攒数据 + 出数据集版本"，重训仍在 ultralytics。
+
+### 1. 开启推理采集（server）
+
+采集默认**关闭**，显式指定目录才开启，避免意外落盘：
+
+```bash
+./bin/go-infer \
+  -capture-dir dataset/pool \
+  -capture-rate 0.1 \
+  -capture-low-conf 0.25 \
+  -capture-quota 5GB
+```
+
+| 参数 | 说明 | 默认 |
+|------|------|------|
+| `-capture-dir` | 采集池根目录；留空不采集 | 空 |
+| `-capture-rate` | 普通样本采样概率 0~1 | 0.1 |
+| `-capture-low-conf` | 最高置信度低于此值的"不确定样本"必存 | 0.25 |
+| `-capture-quota` | 采集池总容量上限（`500MB`/`5GB`/`0` 不限） | 5GB |
+| `-capture-buffer` | 异步写入队列长度 | 256 |
+
+采集策略：**无检测的 hard negative 必存**、**最高置信度低于阈值的不确定样本必存**、其余按 `-capture-rate` 采样。写入是异步的，不阻塞推理响应；队列满时丢最旧待写以保响应不卡。
+
+落盘布局按**模型名 + 日期**两层分组，按天分开、按引擎隔离：
+
+```
+dataset/pool/<engine>/<YYYYMMDD>/images/HHMMSS_<rand>.jpg
+dataset/pool/<engine>/<YYYYMMDD>/labels/HHMMSS_<rand>.txt
+```
+
+标签直接是 YOLO 格式（det `cls cx cy w h`；seg `cls x1 y1 ...` 多边形），所以采集池本身就是一个能用 X-AnyLabeling/Label Studio 打开、改标签的数据集。超出 `-capture-quota` 时按文件 mtime 从最旧的天目录开始成对删除 image+label。
+
+### 2. 审核
+
+用任意 YOLO 标注工具直接打开 `dataset/pool/<engine>/<date>/` 修正标签即可，Go 不内置审核 UI。无标签的图片是 hard negative（推理无检测），审核时按需补标签。
+
+### 3. 回流到训练集（dataset promote）
+
+```bash
+make dataset                        # 构建 cmd/dataset（纯 Go，不依赖 ORT）
+
+# 全部引擎、全部日期合并（移动，清空采集池）
+./bin/dataset promote --pool dataset/pool --into dataset --classes models/coco.names
+
+# 只提升某个引擎、某天的批次
+./bin/dataset promote --engine yolov8n-seg --date 20260810 ...
+
+# 复制而非移动（保留采集池原件）
+./bin/dataset promote --copy ...
+```
+
+每个引擎对应一个**独立** YOLO 数据集 `dataset/<engine>/`（不同模型可能类别体系不同，不混标签），并生成可直接喂给 ultralytics 的 `data.yaml`：
+
+```
+dataset/<engine>/
+├── images/train/<date>_<stem>.jpg
+├── labels/train/<date>_<stem>.txt
+└── data.yaml
+dataset/versions/<engine>-<timestamp>.json   # 本次提升的来源/数量清单
+```
+
+`val/`、`test/` 目录按需自行补充（`data.yaml` 已预留路径）；`test/` 仅供 `cmd/validate` 做发版门禁，不进训练。
 
 ## 测试
 
