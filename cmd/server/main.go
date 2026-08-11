@@ -50,7 +50,12 @@ func main() {
 		captureLow    = flag.Float64("capture-low-conf", 0.25, "最高置信度低于该值的不确定样本必存")
 		captureQuota  = flag.String("capture-quota", "5GB", "采集池总容量上限（如 500MB/5GB/0 表示不限）")
 		captureBuffer = flag.Int("capture-buffer", 256, "异步采集队列长度")
+
+		validateDir   = flag.String("validate-dir", "runs/validate", "网页校验的临时文件目录（上传模型/数据集解压）")
+		validateMaxUp = flag.String("validate-max-upload", "2GB", "校验上传体积上限（模型+数据集，如 500MB/2GB）")
+		validateTests = &testsetFlag{}
 	)
+	flag.Var(validateTests, "validate-testset", "网页可选默认测试集，格式 name=path:split；可重复指定")
 	flag.Parse()
 
 	if lib := ortenv.FindLib(*ortLib); lib != "" {
@@ -114,6 +119,21 @@ func main() {
 		srv.SetBrowser(&captureBrowser{st: capStore, codec: capCodec, poolRoot: *capturePool})
 		log.Printf("推理采集已开启: dir=%s pool=%s rate=%.2f low-conf=%.2f quota=%s",
 			*captureDir, *capturePool, *captureRate, *captureLow, *captureQuota)
+	}
+
+	// 网页模型校验（上传 onnx/zip → 临时 session 跑 mAP）。
+	maxUpload, err := parseSize(*validateMaxUp)
+	if err != nil {
+		log.Fatalf("解析 -validate-max-upload: %v", err)
+	}
+	if vs, err := newValidateService(*validateDir, maxUpload, classList, validateTests.toMap()); err != nil {
+		log.Fatalf("初始化校验服务: %v", err)
+	} else {
+		srv.SetValidator(vs)
+		srv.SetMaxUploadBytes(vs.maxUploadBytes)
+		cleanupStaleScratch(*validateDir)
+		log.Printf("网页校验已开启: scratch=%s max-upload=%s testsets=%d",
+			*validateDir, *validateMaxUp, len(vs.Testsets()))
 	}
 
 	log.Printf("go-infer 服务启动于 %s | 默认引擎=%s task=%s framework=%s classes=%d",

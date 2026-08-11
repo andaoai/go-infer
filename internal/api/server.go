@@ -30,11 +30,13 @@ import (
 
 // Server 持有已注册引擎并路由请求。
 type Server struct {
-	engines  map[string]engine.Engine
-	order    []string // 保持注册顺序，第一个为默认
-	mux      *http.ServeMux
-	recorder Recorder
-	browser  CaptureBrowser
+	engines        map[string]engine.Engine
+	order          []string // 保持注册顺序，第一个为默认
+	mux            *http.ServeMux
+	recorder       Recorder
+	browser        CaptureBrowser
+	validator      Validator
+	maxUploadBytes int64
 }
 
 func NewServer() *Server {
@@ -111,6 +113,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/predict", s.handlePredict)
 	s.mux.HandleFunc("/api/captures", s.handleCaptures)
 	s.mux.HandleFunc("/api/captures/file", s.handleCaptureFile)
+	s.mux.HandleFunc("/api/validate/testsets", s.handleValidateTestsets)
+	s.mux.HandleFunc("/api/validate", s.handleValidate)
 	s.mux.Handle("/", staticHandler())
 }
 

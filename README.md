@@ -274,6 +274,29 @@ CGO_ENABLED=1 go build -o bin/validate ./cmd/validate
 
 > 定位是回归/冒烟校验，不是中立 benchmark：coco128 是 COCO train2017 子集，官方 nano 权重在其上训练过，指标偏高；且 Go 掩膜双线性采样约定与 ultralytics 略有差异（raw mask IoU≈0.92），mask mAP 系统性低几个点属正常。实测全 128 张与 ultralytics `model.val()` 同参数结果接近（det box mAP@.5 ≈0.55 vs 官方 0.61，seg mask mAP@.5 ≈0.46 vs 官方 0.55）。
 
+### 网页校验（上传新模型直接跑 mAP）
+
+看板第三个 tab「验证」让你在更新算法模型时直接把新的 .onnx 拖进网页、选测试集，一键拿到 mAP 报告——不用 SSH 上机器敲命令。检测/分割模型各传一个（缺哪个自动跳过），测试集二选一：启动时用 `-validate-testset name=path:split` 配好的默认集，或当场上传一个数据集 ZIP。
+
+```bash
+./bin/go-infer \
+  -validate-dir runs/validate \
+  -validate-max-upload 2GB \
+  -validate-testset coco128-seg=testdata/coco128-seg:train2017
+```
+
+| 参数 | 说明 | 默认 |
+|------|------|------|
+| `-validate-dir` | 上传模型/数据集解压的临时目录；每次请求独立子目录，跑完即删 | `runs/validate` |
+| `-validate-max-upload` | 单次上传体上限（模型+数据集，`500MB`/`2GB`） | `2GB` |
+| `-validate-testset` | 网页可选默认测试集，格式 `name=path:split`；可重复指定多个 | 空 |
+
+行为与边界：
+- 与 `cmd/validate` 共用同一份 `internal/validate` 逻辑，网页结果和命令行逐位一致（已对拍 coco128-seg 前 16 张）。
+- 每次请求用**独立 scratch 目录 + 独立 ORT session**，跑完 `eng.Close()` 再删目录，不动在线常驻引擎；单飞串行（容量 1 信号量），第二个并发请求返回 `409`。
+- 上传 ZIP 自动探测数据集根（含 `images/`+`labels/` 的目录，是否带顶层包裹目录均可）与 split；多 split 时需在高级参数里指定。
+- 安全：`http.MaxBytesReader` 限体积（超限 `413`）；ZIP 解压防 zip-slip（拒绝绝对路径/`..` 越界/符号链接）并累计解压字节防 zip bomb；结果**只在响应里返回、不落盘、不存历史**。
+
 ## 部署 → 采集 → 回流闭环
 
 训练好新模型后的标准流程是：导出 ONNX → 用 `cmd/validate` 在固定 test 集上跑 mAP 门禁 → 停服替换模型 → 起服上线。线上推理时按策略把**原图 + YOLO 伪标签**采集下来，审核修正后合并回训练集，交给 Python 侧重训。Go 侧只负责"攒数据 + 出数据集版本"，重训仍在 ultralytics。

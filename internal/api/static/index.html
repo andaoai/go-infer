@@ -121,6 +121,54 @@
   #modal .side .kv b{color:var(--text);font-weight:500}
   .close{position:fixed;top:18px;right:24px;font-size:28px;color:var(--muted);cursor:pointer;background:none;border:none}
   .close:hover{color:var(--text)}
+
+  /* validate */
+  .vform{display:grid;gap:14px}
+  .field label.cap{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin-bottom:6px}
+  .pickrow{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  @media(max-width:700px){.pickrow{grid-template-columns:1fr}}
+  .pick{
+    display:block;border:1.5px dashed var(--border);border-radius:8px;padding:16px;text-align:center;
+    color:var(--muted);cursor:pointer;transition:.15s;background:var(--bg);
+  }
+  .pick:hover{border-color:var(--accent)}
+  .pick.has{border-style:solid;border-color:var(--green);color:var(--text)}
+  .pick .t{font-size:13px}
+  .pick .n{font-size:11px;font-family:var(--mono);margin-top:4px;word-break:break-all}
+  .segrow{display:flex;gap:18px;flex-wrap:wrap}
+  .segrow label{display:flex;align-items:center;gap:7px;cursor:pointer;color:var(--text)}
+  .segrow .hint{color:var(--muted);font-size:12px}
+  select,input[type=text],input[type=number]{
+    background:var(--bg);color:var(--text);border:1px solid var(--border);
+    border-radius:6px;padding:6px 9px;font-size:13px;font-family:inherit;width:100%;
+  }
+  .adv{border:1px solid var(--border);border-radius:8px}
+  .adv>summary{cursor:pointer;padding:9px 12px;color:var(--muted);font-size:13px;list-style:none}
+  .adv>summary::-webkit-details-marker{display:none}
+  .adv>summary::before{content:'▸ ';color:var(--accent)}
+  .adv[open]>summary::before{content:'▾ '}
+  .adv .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;padding:0 12px 12px}
+  .adv .grid .field input{width:100%}
+  .vsubmit{display:flex;align-items:center;gap:12px}
+  .errbar{display:none;background:#2a1414;border:1px solid #5c2b2b;color:#ffb3ad;padding:9px 12px;border-radius:7px;font-size:13px}
+  .errbar.on{display:block}
+  #vovery{display:none;position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:60;flex-direction:column;align-items:center;justify-content:center;gap:16px}
+  #vovery.on{display:flex}
+  #vovery .bigspin{width:42px;height:42px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
+  #vovery .vt{color:var(--text);font-size:15px}
+  #vovery .vs{color:var(--muted);font-size:12px}
+  .vresults{display:grid;gap:14px;margin-top:6px}
+  .job{background:var(--panel2);border:1px solid var(--border);border-radius:9px;padding:14px}
+  .job h3{margin:0 0 10px;font-size:14px;display:flex;align-items:center;gap:9px}
+  .job h3 .task{color:var(--accent);font-family:var(--mono);font-size:11px;border:1px solid var(--border);border-radius:20px;padding:1px 8px}
+  .metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:12px}
+  .metric{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:11px 13px}
+  .metric .lab{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+  .metric .big{font-size:26px;font-weight:700;color:var(--green);font-family:var(--mono);line-height:1.2}
+  .metric .sub{font-size:11px;color:var(--muted);font-family:var(--mono)}
+  .job .stat{color:var(--muted);font-size:12px;margin-bottom:8px;font-family:var(--mono)}
+  .apcell.num{font-family:var(--mono)}
+  .bar{display:inline-block;height:8px;border-radius:4px;background:var(--accent);vertical-align:middle;margin-left:8px}
 </style>
 </head>
 <body>
@@ -136,6 +184,7 @@
 <nav class="tabs">
   <button data-tab="infer" class="active">推理</button>
   <button data-tab="pool">采集池</button>
+  <button data-tab="validate">验证</button>
 </nav>
 
 <main>
@@ -174,7 +223,77 @@
       <div id="pool"><div class="empty">加载中…</div></div>
     </div>
   </section>
+
+  <!-- 验证 -->
+  <section id="tab-validate" style="display:none">
+    <div class="panel">
+      <h2>上传新模型并在测试集上跑 mAP</h2>
+      <div class="vform">
+        <div class="pickrow">
+          <label class="pick" id="pickDet">
+            <div class="t">检测 .onnx（可选）</div>
+            <div class="n" id="detName">点击选择 yolov8n.onnx</div>
+            <input type="file" id="detModel" accept=".onnx">
+          </label>
+          <label class="pick" id="pickSeg">
+            <div class="t">分割 .onnx（可选）</div>
+            <div class="n" id="segName">点击选择 yolov8n-seg.onnx</div>
+            <input type="file" id="segModel" accept=".onnx">
+          </label>
+        </div>
+
+        <div class="field">
+          <label class="cap">测试集</label>
+          <div class="segrow">
+            <label><input type="radio" name="dsrc" value="default" checked> 默认测试集</label>
+            <label><input type="radio" name="dsrc" value="upload"> 上传数据集 ZIP</label>
+          </div>
+        </div>
+
+        <div class="field" id="defaultDsRow">
+          <select id="testset"><option value="">加载中…</option></select>
+          <div class="hint" style="color:var(--muted);font-size:12px;margin-top:5px" id="dsHint"></div>
+        </div>
+        <div class="field" id="uploadDsRow" style="display:none">
+          <label class="pick" id="pickZip">
+            <div class="t">数据集 ZIP</div>
+            <div class="n" id="zipName">内含 images/&lt;split&gt; 与 labels/&lt;split&gt;（可带顶层包裹目录）</div>
+            <input type="file" id="datasetZip" accept=".zip">
+          </label>
+        </div>
+
+        <details class="adv">
+          <summary>高级参数</summary>
+          <div class="grid">
+            <div class="field"><label class="cap">imgsz</label><input type="number" id="vImgsz" value="640" min="32" step="32"></div>
+            <div class="field"><label class="cap">conf</label><input type="number" id="vConf" value="0.001" min="0" max="1" step="0.001"></div>
+            <div class="field"><label class="cap">iou</label><input type="number" id="vIou" value="0.7" min="0" max="1" step="0.05"></div>
+            <div class="field"><label class="cap">mask_thr</label><input type="number" id="vMaskThr" value="0.5" min="0" max="1" step="0.05"></div>
+            <div class="field"><label class="cap">limit（0=全量）</label><input type="number" id="vLimit" value="0" min="0" step="10"></div>
+            <div class="field" style="grid-column:1/-1"><label class="cap">classes（逗号分隔，留空用服务端默认）</label><input type="text" id="vClasses" placeholder="person,car,..."></div>
+          </div>
+        </details>
+
+        <div class="errbar" id="vErr"></div>
+
+        <div class="vsubmit">
+          <button class="btn primary" id="vRun">开始校验</button>
+          <span class="spinner" id="vSpin"></span>
+          <span style="color:var(--muted);font-size:12px">结果不保存，看完即走；校验期间服务端单飞，第二个请求会被拒绝。</span>
+        </div>
+      </div>
+    </div>
+
+    <div id="vResults"></div>
+  </section>
 </main>
+
+<!-- 校验进行中遮罩 -->
+<div id="vovery">
+  <div class="bigspin"></div>
+  <div class="vt">正在校验，可能需要数分钟…</div>
+  <div class="vs">请勿关闭页面；完成后一次性返回 mAP 报告。</div>
+</div>
 
 <!-- 大图查看 -->
 <div id="modal">
@@ -239,7 +358,9 @@ document.querySelectorAll('nav.tabs button').forEach(b=>{
     const t=b.dataset.tab;
     $('#tab-infer').style.display = t==='infer'?'block':'none';
     $('#tab-pool').style.display = t==='pool'?'block':'none';
+    $('#tab-validate').style.display = t==='validate'?'block':'none';
     if(t==='pool') loadPool();
+    if(t==='validate') loadValTestsets();
   };
 });
 
@@ -410,6 +531,143 @@ $('#delbtn').onclick=async()=>{
   if(!r.ok){ alert('删除失败: '+await r.text()); return; }
   closeModal(); loadPool();
 };
+
+// ---------- 验证 ----------
+let valTestsetsLoaded = false;
+function bindPick(inputId, boxId, nameId, placeholder){
+  const inp = $('#'+inputId), box = $('#'+boxId), nm = $('#'+nameId);
+  inp.onchange = ()=>{
+    if(inp.files[0]){ box.classList.add('has'); nm.textContent = inp.files[0].name; }
+    else { box.classList.remove('has'); nm.textContent = placeholder; }
+  };
+}
+bindPick('detModel','pickDet','detName','点击选择 yolov8n.onnx');
+bindPick('segModel','pickSeg','segName','点击选择 yolov8n-seg.onnx');
+bindPick('datasetZip','pickZip','zipName','内含 images/<split> 与 labels/<split>（可带顶层包裹目录）');
+
+document.querySelectorAll('input[name=dsrc]').forEach(r=>{
+  r.onchange=()=>{
+    const up = r.value==='upload' && r.checked;
+    $('#uploadDsRow').style.display = up?'block':'none';
+    $('#defaultDsRow').style.display = up?'none':'block';
+  };
+});
+
+async function loadValTestsets(){
+  if(valTestsetsLoaded) return;
+  try{
+    const r = await fetch('/api/validate/testsets');
+    const data = await r.json();
+    const sel = $('#testset');
+    if(!data.enabled){
+      sel.innerHTML = '<option value="">校验未开启</option>';
+      $('#dsHint').textContent = '启动时加 -validate-testset name=path:split 配置默认测试集，或直接上传 ZIP。';
+      valTestsetsLoaded = true; return;
+    }
+    const ts = data.testsets||[];
+    if(!ts.length){
+      sel.innerHTML = '<option value="">（未配置默认测试集，请上传 ZIP）</option>';
+    }else{
+      sel.innerHTML = ts.map(t=>`<option value="${esc(t.name)}">${esc(t.name)} · split=${esc(t.split)}</option>`).join('');
+    }
+    valTestsetsLoaded = true;
+  }catch(e){
+    $('#testset').innerHTML = '<option value="">加载失败</option>';
+    $('#dsHint').textContent = '加载测试集列表失败: '+e.message;
+  }
+}
+
+function vErr(msg){
+  const el = $('#vErr');
+  if(msg){ el.textContent = msg; el.classList.add('on'); }
+  else { el.classList.remove('on'); el.textContent=''; }
+}
+
+$('#vRun').onclick = async ()=>{
+  vErr('');
+  const det = $('#detModel').files[0], seg = $('#segModel').files[0];
+  if(!det && !seg){ vErr('请至少上传一个 .onnx 模型（检测或分割）'); return; }
+  const useUpload = document.querySelector('input[name=dsrc]:checked').value==='upload';
+  const zip = $('#datasetZip').files[0];
+  const tsName = $('#testset').value;
+  if(useUpload){
+    if(!zip){ vErr('请上传数据集 ZIP'); return; }
+  }else if(!tsName){
+    vErr('请选择一个默认测试集，或切换到「上传数据集 ZIP」'); return;
+  }
+
+  const fd = new FormData();
+  if(det) fd.append('det_model', det);
+  if(seg) fd.append('seg_model', seg);
+  if(useUpload) fd.append('dataset', zip);
+  else fd.append('testset', tsName);
+  fd.append('imgsz', $('#vImgsz').value);
+  fd.append('conf', $('#vConf').value);
+  fd.append('iou', $('#vIou').value);
+  fd.append('mask_thr', $('#vMaskThr').value);
+  fd.append('limit', $('#vLimit').value);
+  const classes = $('#vClasses').value.trim();
+  if(classes) fd.append('classes', classes);
+
+  $('#vResults').innerHTML = '';
+  $('#vovery').classList.add('on');
+  $('#vSpin').classList.add('on');
+  try{
+    const r = await fetch('/api/validate',{method:'POST',body:fd});
+    if(!r.ok){
+      const txt = await r.text();
+      if(r.status===409) vErr('已有一个校验在进行中（服务端单飞），请等它完成后再试。');
+      else if(r.status===413) vErr('上传体积超过服务端上限。');
+      else vErr('校验失败: '+(txt || r.status));
+      return;
+    }
+    const rep = await r.json();
+    renderValReport(rep);
+  }catch(e){
+    vErr('请求失败: '+e.message);
+  }finally{
+    $('#vovery').classList.remove('on');
+    $('#vSpin').classList.remove('on');
+  }
+};
+
+function renderValReport(rep){
+  const host = $('#vResults');
+  const head = `<div class="meta" style="margin-bottom:6px">共 ${rep.images} 张 · ${rep.classes} 个类 · 总耗时 ${(rep.took_ms/1000).toFixed(1)}s</div>`;
+  if(!rep.jobs || !rep.jobs.length){
+    host.innerHTML = head + '<div class="empty">没有任务结果</div>';
+    return;
+  }
+  host.innerHTML = head + '<div class="vresults">' + rep.jobs.map(job=>{
+    const metrics = (job.metrics||[]).map(m=>{
+      const pct = v=> (v*100).toFixed(1);
+      return `<div class="metric">
+        <div class="lab">${esc(m.label)} mAP@.5</div>
+        <div class="big">${pct(m.map50)}</div>
+        <div class="sub">mAP@.5:.95 ${pct(m.map5095)}</div>
+      </div>`;
+    }).join('');
+    const rows = (job.metrics||[]).flatMap(m=>{
+      const list = (m.per_class||[]).slice().sort((a,b)=>b.ap50-a.ap50);
+      return list.map((c,i)=>{
+        const v = c.ap50;
+        const w = Math.round(v*120);
+        return `<tr>
+          ${i===0?`<td rowspan="${list.length}" style="vertical-align:top;color:var(--muted)">${esc(m.label)}</td>`:''}
+          <td><span class="swatch" style="background:${PAL[c.class_id%PAL.length]}"></span>${esc(c.class_name)}<span style="color:var(--muted)"> #${c.class_id}</span></td>
+          <td class="num apcell">${(v*100).toFixed(1)}<span class="bar" style="width:${w}px"></span></td>
+        </tr>`;
+      });
+    }).join('');
+    const table = rows ? `<table><thead><tr><th style="width:60px">指标</th><th>类别</th><th>AP@.5</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">无 GT 类别</div>';
+    return `<div class="job">
+      <h3>${esc(job.name)} <span class="task">${esc(job.task)}</span></h3>
+      <div class="stat">预测 ${job.predictions} · 标注 ${job.ground_truths} · 耗时 ${(job.took_ms/1000).toFixed(1)}s</div>
+      <div class="metrics">${metrics}</div>
+      ${table}
+    </div>`;
+  }).join('') + '</div>';
+}
 
 // ---------- init ----------
 loadEngines();
