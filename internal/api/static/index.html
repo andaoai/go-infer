@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>go-infer · 看板</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --border:#30363d;
+    --text:#c9d1d9; --muted:#8b949e; --accent:#2f81f7; --green:#3fb950;
+    --red:#f85149; --yellow:#d29922; --purple:#bc8cff;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    background:var(--bg);color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    font-size:14px;line-height:1.5;
+  }
+  header{
+    display:flex;align-items:center;gap:16px;flex-wrap:wrap;
+    padding:10px 18px;background:var(--panel);border-bottom:1px solid var(--border);
+    position:sticky;top:0;z-index:20;
+  }
+  header .brand{font-weight:700;font-size:16px;letter-spacing:.5px}
+  header .brand span{color:var(--accent)}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--muted);display:inline-block;margin-right:6px}
+  .dot.ok{background:var(--green);box-shadow:0 0 8px var(--green)}
+  .dot.bad{background:var(--red)}
+  .engines{display:flex;gap:6px;flex-wrap:wrap}
+  .chip{
+    padding:4px 10px;border-radius:20px;border:1px solid var(--border);
+    background:var(--panel2);cursor:pointer;font-size:12px;color:var(--muted);
+    display:flex;align-items:center;gap:6px;
+  }
+  .chip.active{border-color:var(--accent);color:var(--text);background:#1f2a44}
+  .chip .task{color:var(--accent);font-family:var(--mono);font-size:11px}
+  .ctrl{display:flex;align-items:center;gap:8px;margin-left:auto;color:var(--muted)}
+  .ctrl input[type=range]{width:120px}
+  .ctrl .val{font-family:var(--mono);color:var(--text);min-width:34px;text-align:right}
+  nav.tabs{display:flex;gap:4px;padding:0 18px;background:var(--panel);border-bottom:1px solid var(--border)}
+  nav.tabs button{
+    background:none;border:none;color:var(--muted);padding:10px 16px;cursor:pointer;
+    border-bottom:2px solid transparent;font-size:14px;
+  }
+  nav.tabs button.active{color:var(--text);border-bottom-color:var(--accent)}
+  main{padding:18px;max-width:1400px;margin:0 auto}
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:18px}
+  .panel h2{margin:0 0 12px;font-size:14px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.8px}
+
+  /* drop zone */
+  #drop{
+    display:block;
+    border:2px dashed var(--border);border-radius:10px;padding:40px;text-align:center;
+    color:var(--muted);cursor:pointer;transition:.15s;
+  }
+  #drop.hover{border-color:var(--accent);background:#16233f;color:var(--text)}
+  #drop p{margin:6px 0}
+  #drop .big{font-size:16px;color:var(--text)}
+  input[type=file]{display:none}
+  button.btn{
+    background:var(--panel2);color:var(--text);border:1px solid var(--border);
+    padding:6px 14px;border-radius:7px;cursor:pointer;font-size:13px;
+  }
+  button.btn:hover{border-color:var(--accent)}
+  button.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button.btn.danger{color:var(--red);border-color:#5c2b2b}
+  button.btn.danger:hover{background:#2a1414}
+
+  .infer{display:grid;grid-template-columns:1fr 320px;gap:18px}
+  @media(max-width:900px){.infer{grid-template-columns:1fr}}
+  #canvasWrap{background:#000;border-radius:8px;overflow:hidden;display:flex;justify-content:center}
+  canvas{max-width:100%;height:auto;display:block}
+  .meta{color:var(--muted);font-size:12px;margin-top:8px;font-family:var(--mono)}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--border)}
+  th{color:var(--muted);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+  td.num{font-family:var(--mono);color:var(--muted)}
+  tr.row{cursor:pointer}
+  tr.row:hover,tr.row.sel{background:var(--panel2)}
+  .swatch{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px;vertical-align:middle}
+  .empty{color:var(--muted);text-align:center;padding:30px}
+
+  /* pool */
+  .group{margin-bottom:18px}
+  .group>h3{margin:0 0 8px;font-size:14px;display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none}
+  .group>h3 .cnt{color:var(--muted);font-weight:400;font-size:12px}
+  .date{margin:10px 0 14px;padding-left:14px;border-left:2px solid var(--border)}
+  .date>h4{margin:6px 0;font-size:12px;color:var(--yellow);font-weight:500;font-family:var(--mono)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px}
+  .thumb{
+    position:relative;background:#000;border:1px solid var(--border);border-radius:6px;
+    overflow:hidden;cursor:pointer;aspect-ratio:1;
+  }
+  .thumb img{width:100%;height:100%;object-fit:cover;display:block}
+  .thumb .tag{
+    position:absolute;top:4px;left:4px;background:rgba(0,0,0,.7);color:var(--green);
+    font-size:10px;padding:1px 5px;border-radius:4px;font-family:var(--mono);
+  }
+  .thumb .tag.nolabel{color:var(--red)}
+  .toolbar{display:flex;align-items:center;gap:12px;margin-bottom:14px;color:var(--muted)}
+  .toolbar label{display:flex;align-items:center;gap:6px;cursor:pointer}
+  .spinner{display:none;width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
+  .spinner.on{display:inline-block}
+  @keyframes spin{to{transform:rotate(360deg)}}
+
+  /* modal */
+  #modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:50;padding:30px;overflow:auto}
+  #modal.on{display:flex;gap:18px;justify-content:center;align-items:flex-start}
+  #modal .box{background:var(--panel);border:1px solid var(--border);border-radius:10px;max-width:1100px;width:100%;display:grid;grid-template-columns:1fr 340px}
+  @media(max-width:900px){#modal .box{grid-template-columns:1fr}}
+  #modal .imgcol{background:#000;display:flex;align-items:center;justify-content:center;min-height:200px}
+  #modal .imgcol img{max-width:100%;height:auto}
+  #modal .side{padding:16px;display:flex;flex-direction:column;gap:12px}
+  #modal .side pre{
+    background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px;
+    overflow:auto;max-height:50vh;margin:0;font-family:var(--mono);font-size:12px;color:var(--text);
+  }
+  #modal .side .kv{color:var(--muted);font-size:12px;word-break:break-all}
+  #modal .side .kv b{color:var(--text);font-weight:500}
+  .close{position:fixed;top:18px;right:24px;font-size:28px;color:var(--muted);cursor:pointer;background:none;border:none}
+  .close:hover{color:var(--text)}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">go-<span>infer</span></div>
+  <div id="status"><span class="dot" id="dot"></span><span id="statustxt">连接中…</span></div>
+  <div class="engines" id="engines"></div>
+  <div class="ctrl">
+    <label>conf <input type="range" id="conf" min="0.05" max="0.95" step="0.05" value="0.25"><span class="val" id="confval">0.25</span></label>
+  </div>
+</header>
+
+<nav class="tabs">
+  <button data-tab="infer" class="active">推理</button>
+  <button data-tab="pool">采集池</button>
+</nav>
+
+<main>
+  <!-- 推理 -->
+  <section id="tab-infer">
+    <div class="panel">
+      <h2>上传图片</h2>
+      <label id="drop" for="file">
+        <p class="big">点击选择 / 拖入图片</p>
+        <p>JPEG / PNG · 推理后在此处画框，结果在右侧</p>
+        <input type="file" id="file" accept="image/*">
+      </label>
+    </div>
+    <div class="infer">
+      <div class="panel" style="margin:0">
+        <h2>可视化</h2>
+        <div id="canvasWrap"><div class="empty" id="ph">尚未推理</div></div>
+        <div class="meta" id="infermeta"></div>
+      </div>
+      <div class="panel" style="margin:0">
+        <h2>结果</h2>
+        <div id="resultbox"><div class="empty">无结果</div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 采集池 -->
+  <section id="tab-pool" style="display:none">
+    <div class="panel">
+      <div class="toolbar">
+        <button class="btn" id="refresh">刷新</button>
+        <span class="spinner" id="spin"></span>
+        <label><input type="checkbox" id="autoref"> 自动刷新（5s）</label>
+        <span id="poolsummary"></span>
+      </div>
+      <div id="pool"><div class="empty">加载中…</div></div>
+    </div>
+  </section>
+</main>
+
+<!-- 大图查看 -->
+<div id="modal">
+  <button class="close" id="modalclose">&times;</button>
+  <div class="box">
+    <div class="imgcol" id="modalimg"></div>
+    <div class="side">
+      <div>
+        <div class="kv" id="modalkey"></div>
+        <div class="kv" id="metainfo"></div>
+      </div>
+      <div>
+        <h2 style="margin:0 0 6px">标签</h2>
+        <pre id="modallabel">加载中…</pre>
+      </div>
+      <div style="display:flex;gap:8px">
+        <button class="btn danger" id="delbtn">删除 image+label</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const PAL = ['#3fb950','#f85149','#58a6ff','#d29922','#bc8cff','#ff7b72','#39c5cf','#f0883e'];
+let engines = [], currentEngine = '';
+let lastResult = null, lastImage = null, hoverIdx = -1;
+const $ = s => document.querySelector(s);
+const esc = s => (s+'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+// ---------- 引擎 / 状态 ----------
+async function loadEngines(){
+  try{
+    const [h, e] = await Promise.all([fetch('/health').then(r=>r.json()), fetch('/engines').then(r=>r.json())]);
+    engines = e.engines || [];
+    $('#dot').className = 'dot ok';
+    $('#statustxt').textContent = `${h.engines} 个引擎 · 在线`;
+    renderEngines();
+  }catch(err){
+    $('#dot').className = 'dot bad';
+    $('#statustxt').textContent = '服务不可达';
+  }
+}
+function renderEngines(){
+  const el = $('#engines');
+  if(!engines.length){ el.innerHTML = '<span style="color:var(--muted);font-size:12px">无引擎</span>'; return; }
+  if(!engines.find(e=>e.name===currentEngine)) currentEngine = engines[0].name;
+  el.innerHTML = engines.map(e=>`
+    <div class="chip ${e.name===currentEngine?'active':''}" data-name="${esc(e.name)}">
+      <span class="task">${esc(e.task)}</span>${esc(e.name)}
+    </div>`).join('');
+  el.querySelectorAll('.chip').forEach(c=>c.onclick=()=>{ currentEngine=c.dataset.name; renderEngines(); });
+}
+
+// ---------- conf ----------
+$('#conf').oninput = e => $('#confval').textContent = Number(e.target.value).toFixed(2);
+
+// ---------- tabs ----------
+document.querySelectorAll('nav.tabs button').forEach(b=>{
+  b.onclick=()=>{
+    document.querySelectorAll('nav.tabs button').forEach(x=>x.classList.remove('active'));
+    b.classList.add('active');
+    const t=b.dataset.tab;
+    $('#tab-infer').style.display = t==='infer'?'block':'none';
+    $('#tab-pool').style.display = t==='pool'?'block':'none';
+    if(t==='pool') loadPool();
+  };
+});
+
+// ---------- 推理 ----------
+const drop = $('#drop'), fileInput = $('#file');
+// 整页阻止默认拖放，避免拖到非上传区时浏览器直接打开文件。
+['dragenter','dragover','drop'].forEach(ev=>document.addEventListener(ev,e=>e.preventDefault()));
+// 计数器避免在 drop 内部子元素间移动时 hover 闪烁。
+let dragDepth = 0;
+drop.addEventListener('dragenter',e=>{e.preventDefault();dragDepth++;drop.classList.add('hover');});
+drop.addEventListener('dragover',e=>e.preventDefault());
+drop.addEventListener('dragleave',()=>{dragDepth=Math.max(0,dragDepth-1);if(dragDepth===0)drop.classList.remove('hover');});
+drop.addEventListener('drop',e=>{e.preventDefault();dragDepth=0;drop.classList.remove('hover');if(e.dataTransfer.files[0])runInfer(e.dataTransfer.files[0]);});
+fileInput.onchange = ()=>{ if(fileInput.files[0]) runInfer(fileInput.files[0]); };
+
+async function runInfer(file){
+  if(!currentEngine){ alert('没有可用引擎'); return; }
+  const fd = new FormData();
+  fd.append('file', file);
+  const url = `/predict?engine=${encodeURIComponent(currentEngine)}&conf=${$('#conf').value}`;
+  $('#ph') && ($('#ph').textContent = '推理中…');
+  const t0 = performance.now();
+  let res;
+  try{
+    const r = await fetch(url,{method:'POST',body:fd});
+    if(!r.ok){ throw new Error(await r.text()); }
+    res = await r.json();
+  }catch(err){
+    $('#canvasWrap').innerHTML = `<div class="empty">推理失败: ${esc(err.message)}</div>`;
+    return;
+  }
+  const img = new Image();
+  img.onload = ()=>{ lastImage=img; lastResult=res; drawOverlay(); renderResult(res, performance.now()-t0); };
+  img.src = URL.createObjectURL(file);
+}
+
+function drawOverlay(){
+  const img = lastImage, res = lastResult;
+  const wrap = $('#canvasWrap');
+  wrap.innerHTML = '';
+  const cv = document.createElement('canvas');
+  cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+  const ctx = cv.getContext('2d');
+  ctx.drawImage(img,0,0);
+  const items = res.detections ? res.detections.map(d=>({...d,mask:null})) :
+                res.instances ? res.instances : [];
+  items.forEach((it,i)=>{
+    const c = PAL[it.class_id % PAL.length];
+    const lw = Math.max(1, Math.round(img.naturalWidth/400));
+    if(it.mask && it.mask.length){
+      ctx.fillStyle = c+'33'; ctx.strokeStyle=c; ctx.lineWidth=lw;
+      it.mask.forEach(ring=>{
+        ctx.beginPath(); ring.forEach((p,k)=> k?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y)); ctx.closePath(); ctx.fill(); ctx.stroke();
+      });
+    }
+    // box
+    const [x1,y1,x2,y2]=[it.x1,it.y1,it.x2,it.y2];
+    ctx.strokeStyle = i===hoverIdx?'#ffffff':c; ctx.lineWidth=(i===hoverIdx?lw+2:lw);
+    ctx.strokeRect(x1,y1,x2-x1,y2-y1);
+    // label
+    const label = `${it.class_name} ${it.confidence.toFixed(2)}`;
+    ctx.font = `${Math.max(12,Math.round(img.naturalWidth/55))}px ui-monospace,monospace`;
+    const tw = ctx.measureText(label).width;
+    ctx.fillStyle = c; ctx.fillRect(x1, Math.max(0,y1-20), tw+8, 20);
+    ctx.fillStyle = '#000'; ctx.fillText(label, x1+4, Math.max(14,y1-5));
+  });
+  wrap.appendChild(cv);
+  $('#infermeta').textContent =
+    `${res.engine} · ${res.task} · ${items.length} 个结果 · 服务端 ${res.took_ms}ms · ${img.naturalWidth}×${img.naturalHeight}`;
+}
+
+function renderResult(res, totalMs){
+  const items = res.detections || res.instances || [];
+  if(!items.length){ $('#resultbox').innerHTML='<div class="empty">无检测（hard negative）</div>'; return; }
+  const isSeg = !!res.instances;
+  $('#resultbox').innerHTML = `
+    <table><thead><tr>
+      <th>类别</th><th>置信</th>${isSeg?'<th>形状</th>':'<th>坐标</th>'}
+    </tr></thead><tbody>
+    ${items.map((it,i)=>`
+      <tr class="row" data-i="${i}">
+        <td><span class="swatch" style="background:${PAL[it.class_id%PAL.length]}"></span>${esc(it.class_name)}<span style="color:var(--muted)"> #${it.class_id}</span></td>
+        <td class="num">${it.confidence.toFixed(3)}</td>
+        <td class="num">${isSeg? (it.mask?it.mask.reduce((a,r)=>a+r.length,0)+' 点':'框') :
+          `${Math.round(it.x1)},${Math.round(it.y1)} ${Math.round(it.x2)},${Math.round(it.y2)}`}</td>
+      </tr>`).join('')}
+    </tbody></table>
+    <div class="meta">往返 ${Math.round(totalMs)}ms</div>`;
+  $('#resultbox').querySelectorAll('tr.row').forEach(tr=>{
+    tr.onmouseenter=()=>{hoverIdx=+tr.dataset.i; drawOverlay();};
+    tr.onmouseleave=()=>{hoverIdx=-1; drawOverlay();};
+    tr.onclick=()=>{ hoverIdx=(hoverIdx===+tr.dataset.i?-1:+tr.dataset.i); drawOverlay();
+      $('#resultbox').querySelectorAll('tr.row').forEach(x=>x.classList.toggle('sel',+x.dataset.i===hoverIdx)); };
+  });
+}
+
+// ---------- 采集池 ----------
+let autoTimer=null;
+$('#autoref').onchange=e=>{
+  if(e.target.checked){ autoTimer=setInterval(loadPool,5000); loadPool(); }
+  else clearInterval(autoTimer);
+};
+$('#refresh').onclick=loadPool;
+
+async function loadPool(){
+  $('#spin').classList.add('on');
+  try{
+    const r = await fetch('/api/captures');
+    const data = await r.json();
+    if(!data.enabled){ $('#pool').innerHTML='<div class="empty">采集未开启（启动时加 -capture-dir 启用）</div>'; $('#poolsummary').textContent=''; return; }
+    renderPool(data.groups||[]);
+  }catch(e){
+    $('#pool').innerHTML=`<div class="empty">加载失败: ${esc(e.message)}</div>`;
+  }finally{ $('#spin').classList.remove('on'); }
+}
+function renderPool(groups){
+  let total=0;
+  groups.forEach(g=>g.dates.forEach(d=>total+=d.files.length));
+  $('#poolsummary').textContent = `${groups.length} 引擎 · ${total} 张`;
+  if(!total){ $('#pool').innerHTML='<div class="empty">采集池为空</div>'; return; }
+  $('#pool').innerHTML = groups.map(g=>{
+    const gtotal = g.dates.reduce((a,d)=>a+d.files.length,0);
+    return `<div class="group">
+      <h3>▾ ${esc(g.engine)} <span class="cnt">${gtotal} 张</span></h3>
+      <div>${g.dates.map(d=>`
+        <div class="date">
+          <h4>${esc(d.date)} · ${d.files.length}</h4>
+          <div class="grid">${d.files.map(f=>thumb(f)).join('')}</div>
+        </div>`).join('')}</div></div>`;
+  }).join('');
+  $('#pool').querySelectorAll('.thumb').forEach(t=>t.onclick=()=>openModal(t.dataset.key));
+}
+function thumb(f){
+  const src = `/api/captures/file?key=${encodeURIComponent(f.key)}&t=${f.when}`;
+  return `<div class="thumb" data-key="${esc(f.key)}">
+    <img loading="lazy" src="${src}" alt="">
+    <span class="tag ${f.has_label?'':'nolabel'}">${f.has_label?'LABEL':'NO-LBL'}</span>
+  </div>`;
+}
+
+// ---------- modal ----------
+let currentKey=null;
+function openModal(key){
+  currentKey=key;
+  $('#modal').classList.add('on');
+  $('#modalimg').innerHTML = `<img src="/api/captures/file?key=${encodeURIComponent(key)}&t=${Date.now()}">`;
+  $('#modalkey').innerHTML = '<b>key</b> '+esc(key);
+  $('#modallabel').textContent='加载中…'; $('#metainfo').textContent='';
+  // find file meta
+  fetch('/api/captures').then(r=>r.json()).then(data=>{
+    const f=(data.groups||[]).flatMap(g=>g.dates).flatMap(d=>d.files).find(x=>x.key===key);
+    if(f){
+      $('#metainfo').innerHTML = `<b>大小</b> ${(f.size/1024).toFixed(1)} KB · <b>时间</b> ${new Date(f.when*1000).toLocaleString()}`;
+      if(f.has_label && f.label_key){
+        fetch('/api/captures/file?key='+encodeURIComponent(f.label_key)).then(r=>r.text()).then(t=>$('#modallabel').textContent=t||'(空标签 / hard negative)');
+      }else{ $('#modallabel').textContent='(无标签，hard negative)'; }
+    }
+  });
+}
+$('#modalclose').onclick=closeModal;
+$('#modal').addEventListener('click',e=>{ if(e.target.id==='modal') closeModal(); });
+document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeModal(); });
+function closeModal(){ $('#modal').classList.remove('on'); currentKey=null; }
+$('#delbtn').onclick=async()=>{
+  if(!currentKey) return;
+  if(!confirm('删除这张图片及其标签？')) return;
+  const r=await fetch('/api/captures/file?key='+encodeURIComponent(currentKey),{method:'DELETE'});
+  if(!r.ok){ alert('删除失败: '+await r.text()); return; }
+  closeModal(); loadPool();
+};
+
+// ---------- init ----------
+loadEngines();
+setInterval(loadEngines, 10000);
+</script>
+</body>
+</html>

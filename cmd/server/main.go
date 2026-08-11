@@ -19,8 +19,10 @@ import (
 	"github.com/andaoai/go-infer/internal/engine"
 	"github.com/andaoai/go-infer/internal/engines/onnxruntime/detect"
 	"github.com/andaoai/go-infer/internal/engines/onnxruntime/seg"
+	"github.com/andaoai/go-infer/internal/format"
 	"github.com/andaoai/go-infer/internal/format/yolo"
 	"github.com/andaoai/go-infer/internal/ortenv"
+	"github.com/andaoai/go-infer/internal/storage"
 	"github.com/andaoai/go-infer/internal/storage/local"
 	ort "github.com/yalue/onnxruntime_go"
 )
@@ -94,11 +96,22 @@ func main() {
 	// 在此 srv.Register(...) 更多引擎（TensorRT/NCNN/llama.cpp ...）。
 
 	// 推理采集（原图 + YOLO 伪标签），默认关闭。
-	if rec, err := newCaptureRecorder(*captureDir, *capturePool, *captureRate, float32(*captureLow), *captureQuota, *captureBuffer); err != nil {
+	// store/codec 在采集器与采集池浏览器之间共享。
+	var capStore storage.Storage
+	var capCodec format.Codec
+	if *captureDir != "" {
+		st, err := local.New(*captureDir)
+		if err != nil {
+			log.Fatalf("初始化采集存储: %v", err)
+		}
+		capStore, capCodec = st, yolo.New()
+	}
+	if rec, err := newCaptureRecorder(capStore, capCodec, *capturePool, *captureRate, float32(*captureLow), *captureQuota, *captureBuffer); err != nil {
 		log.Fatalf("初始化采集器: %v", err)
 	} else if rec != nil {
 		srv.SetRecorder(recAdapter{rec})
 		defer rec.Close()
+		srv.SetBrowser(&captureBrowser{st: capStore, codec: capCodec, poolRoot: *capturePool})
 		log.Printf("推理采集已开启: dir=%s pool=%s rate=%.2f low-conf=%.2f quota=%s",
 			*captureDir, *capturePool, *captureRate, *captureLow, *captureQuota)
 	}
@@ -137,14 +150,10 @@ var (
 	_ engine.Engine = (*seg.Engine)(nil)
 )
 
-// newCaptureRecorder 构造采集器；dir 为空返回 nil 表示不采集。
-func newCaptureRecorder(dir, poolRoot string, rate float64, lowConf float32, quota string, buffer int) (*capture.Recorder, error) {
-	if dir == "" {
+// newCaptureRecorder 构造采集器；store 为 nil 时返回 nil 表示不采集。
+func newCaptureRecorder(st storage.Storage, codec format.Codec, poolRoot string, rate float64, lowConf float32, quota string, buffer int) (*capture.Recorder, error) {
+	if st == nil || codec == nil {
 		return nil, nil
-	}
-	st, err := local.New(dir)
-	if err != nil {
-		return nil, err
 	}
 	quotaBytes, err := parseSize(quota)
 	if err != nil {
@@ -152,7 +161,7 @@ func newCaptureRecorder(dir, poolRoot string, rate float64, lowConf float32, quo
 	}
 	return capture.New(capture.Config{
 		Store:      st,
-		Codec:      yolo.New(),
+		Codec:      codec,
 		PoolRoot:   poolRoot,
 		Rate:       rate,
 		LowConf:    lowConf,

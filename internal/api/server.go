@@ -6,6 +6,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"image"
@@ -16,6 +17,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -32,6 +34,7 @@ type Server struct {
 	order    []string // 保持注册顺序，第一个为默认
 	mux      *http.ServeMux
 	recorder Recorder
+	browser  CaptureBrowser
 }
 
 func NewServer() *Server {
@@ -56,8 +59,42 @@ type Recorder interface {
 	Record(s CaptureSample)
 }
 
+// CaptureFile 是采集池里的一张图片（及是否有对应标签）。
+type CaptureFile struct {
+	Key      string `json:"key"`
+	LabelKey string `json:"label_key"`
+	Name     string `json:"name"`
+	Size     int64  `json:"size"`
+	HasLabel bool   `json:"has_label"`
+	When     int64  `json:"when"` // mtime，Unix 秒
+}
+
+// CaptureDate 是某引擎某天的采集批次。
+type CaptureDate struct {
+	Date  string        `json:"date"`
+	Count int           `json:"count"`
+	Files []CaptureFile `json:"files"`
+}
+
+// CaptureGroup 是某引擎的全部采集批次。
+type CaptureGroup struct {
+	Engine string        `json:"engine"`
+	Count  int           `json:"count"`
+	Dates  []CaptureDate `json:"dates"`
+}
+
+// CaptureBrowser 是可选的采集池浏览能力（cmd/server 用 storage+codec 实现）。
+type CaptureBrowser interface {
+	Groups(ctx context.Context) ([]CaptureGroup, error)
+	Open(ctx context.Context, key string) (io.ReadCloser, error)
+	Remove(ctx context.Context, imageKey string) error
+}
+
 // SetRecorder 挂载采集器；传 nil 关闭采集。
 func (s *Server) SetRecorder(r Recorder) { s.recorder = r }
+
+// SetBrowser 挂载采集池浏览器（供前端查看/删除已采集样本）；传 nil 关闭。
+func (s *Server) SetBrowser(b CaptureBrowser) { s.browser = b }
 
 // Register 挂载一个引擎。
 func (s *Server) Register(e engine.Engine) {
@@ -72,6 +109,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/health", s.handleHealth)
 	s.mux.HandleFunc("/engines", s.handleEngines)
 	s.mux.HandleFunc("/predict", s.handlePredict)
+	s.mux.HandleFunc("/api/captures", s.handleCaptures)
+	s.mux.HandleFunc("/api/captures/file", s.handleCaptureFile)
+	s.mux.Handle("/", staticHandler())
 }
 
 func (s *Server) Handler() http.Handler { return logging(s.mux) }
@@ -234,6 +274,61 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// ---------- 采集池浏览 ----------
+
+func (s *Server) handleCaptures(w http.ResponseWriter, r *http.Request) {
+	if s.browser == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"enabled": false, "groups": []CaptureGroup{}})
+		return
+	}
+	groups, err := s.browser.Groups(r.Context())
+	if err != nil {
+		http.Error(w, "list captures: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"enabled": true, "groups": groups})
+}
+
+func (s *Server) handleCaptureFile(w http.ResponseWriter, r *http.Request) {
+	if s.browser == nil {
+		http.Error(w, "capture disabled", http.StatusNotFound)
+		return
+	}
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		http.Error(w, "missing key", http.StatusBadRequest)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		rc, err := s.browser.Open(r.Context(), key)
+		if err != nil {
+			http.Error(w, "open: "+err.Error(), http.StatusNotFound)
+			return
+		}
+		defer rc.Close()
+		switch strings.ToLower(filepath.Ext(key)) {
+		case ".jpg", ".jpeg":
+			w.Header().Set("Content-Type", "image/jpeg")
+		case ".png":
+			w.Header().Set("Content-Type", "image/png")
+		case ".txt":
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		default:
+			w.Header().Set("Content-Type", "application/octet-stream")
+		}
+		_, _ = io.Copy(w, rc)
+	case http.MethodDelete:
+		if err := s.browser.Remove(r.Context(), key); err != nil {
+			http.Error(w, "remove: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": key})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 func logging(next http.Handler) http.Handler {
