@@ -37,6 +37,8 @@
   .chip.active{border-color:var(--accent);color:var(--text);background:#1f2a44}
   .chip .task{color:var(--accent);font-family:var(--mono);font-size:11px}
   .ctrl{display:flex;align-items:center;gap:8px;margin-left:auto;color:var(--muted)}
+  .inferbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  .inferbar .ctrl{margin-left:auto}
   .ctrl input[type=range]{width:120px}
   .ctrl .val{font-family:var(--mono);color:var(--text);min-width:34px;text-align:right}
   nav.tabs{display:flex;gap:4px;padding:0 18px;background:var(--panel);border-bottom:1px solid var(--border)}
@@ -175,10 +177,6 @@
 <header>
   <div class="brand">go-<span>infer</span></div>
   <div id="status"><span class="dot" id="dot"></span><span id="statustxt">连接中…</span></div>
-  <div class="engines" id="engines"></div>
-  <div class="ctrl">
-    <label>conf <input type="range" id="conf" min="0.05" max="0.95" step="0.05" value="0.25"><span class="val" id="confval">0.25</span></label>
-  </div>
 </header>
 
 <nav class="tabs">
@@ -190,6 +188,14 @@
 <main>
   <!-- 推理 -->
   <section id="tab-infer">
+    <div class="panel">
+      <div class="inferbar">
+        <div class="engines" id="engines"></div>
+        <div class="ctrl">
+          <label>conf <input type="range" id="conf" min="0.05" max="0.95" step="0.05" value="0.25"><span class="val" id="confval">0.25</span></label>
+        </div>
+      </div>
+    </div>
     <div class="panel">
       <h2>上传图片</h2>
       <label id="drop" for="file">
