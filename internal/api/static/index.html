@@ -144,6 +144,45 @@
     background:var(--bg);color:var(--text);border:1px solid var(--border);
     border-radius:6px;padding:6px 9px;font-size:13px;font-family:inherit;width:100%;
   }
+  select:focus,input[type=text]:focus,input[type=number]:focus{
+    outline:none;border-color:var(--accent);box-shadow:0 0 0 2px rgba(47,129,247,.25);
+  }
+  select option{background:var(--panel);color:var(--text)}
+  /* 复选/单选：用 accent-color 统一成主题蓝，去原生白底 */
+  input[type=checkbox],input[type=radio]{
+    appearance:none;-webkit-appearance:none;width:15px;height:15px;margin:0;
+    background:var(--bg);border:1px solid var(--border);border-radius:3px;
+    display:inline-grid;place-content:center;cursor:pointer;flex:none;
+  }
+  input[type=radio]{border-radius:50%}
+  input[type=checkbox]:hover,input[type=radio]:hover{border-color:var(--accent)}
+  input[type=checkbox]:checked,input[type=radio]:checked{
+    background:var(--accent);border-color:var(--accent);
+  }
+  input[type=radio]:checked::after{
+    content:"";width:7px;height:7px;border-radius:50%;background:#fff;
+  }
+  input[type=checkbox]:checked::after{
+    content:"";width:4px;height:8px;border:solid #fff;border-width:0 2px 2px 0;
+    transform:rotate(45deg) translate(-1px,-1px);
+  }
+  input[type=checkbox]:focus-visible,input[type=radio]:focus-visible{
+    box-shadow:0 0 0 2px rgba(47,129,247,.3);
+  }
+  /* 滑块：细灰轨道 + 主题蓝拇指，跨浏览器 */
+  input[type=range]{
+    -webkit-appearance:none;appearance:none;width:120px;height:4px;
+    background:var(--border);border-radius:4px;outline:none;cursor:pointer;
+  }
+  input[type=range]::-webkit-slider-thumb{
+    -webkit-appearance:none;appearance:none;width:15px;height:15px;border-radius:50%;
+    background:var(--accent);border:2px solid var(--panel);cursor:pointer;
+    box-shadow:0 0 0 1px var(--accent);
+  }
+  input[type=range]::-moz-range-thumb{
+    width:13px;height:13px;border-radius:50%;background:var(--accent);
+    border:2px solid var(--panel);cursor:pointer;
+  }
   .adv{border:1px solid var(--border);border-radius:8px}
   .adv>summary{cursor:pointer;padding:9px 12px;color:var(--muted);font-size:13px;list-style:none}
   .adv>summary::-webkit-details-marker{display:none}
