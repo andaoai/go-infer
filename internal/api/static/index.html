@@ -210,6 +210,38 @@
   .job .stat{color:var(--muted);font-size:12px;margin-bottom:8px;font-family:var(--mono)}
   .apcell.num{font-family:var(--mono)}
   .bar{display:inline-block;height:8px;border-radius:4px;background:var(--accent);vertical-align:middle;margin-left:8px}
+
+  /* video */
+  .vlayout{display:grid;grid-template-columns:300px 1fr;gap:14px}
+  @media(max-width:900px){.vlayout{grid-template-columns:1fr}}
+  .vsources{display:flex;flex-direction:column;gap:8px;max-height:460px;overflow:auto}
+  .vcat{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);
+    margin:8px 0 2px;padding-bottom:3px;border-bottom:1px solid var(--border)}
+  .vcat:first-child{margin-top:0}
+  .vsrc{
+    border:1px solid var(--border);border-radius:8px;padding:10px 11px;cursor:pointer;background:var(--bg);
+    display:flex;flex-direction:column;gap:3px;transition:.15s;
+  }
+  .vsrc:hover{border-color:var(--accent)}
+  .vsrc.active{border-color:var(--accent);background:rgba(47,129,247,.1)}
+  .vsrc .n{font-size:13px;color:var(--text);display:flex;align-items:center;gap:7px}
+  .vsrc .k{font-family:var(--mono);font-size:9px;text-transform:uppercase;border:1px solid var(--border);color:var(--muted);border-radius:10px;padding:0 6px}
+  .vsrc .note{font-size:11px;color:var(--muted)}
+  .vsrc .be{font-size:10px;color:var(--warn, #d29922)}
+  .vadd{margin-top:4px;display:flex;flex-direction:column;gap:7px}
+  .vadd input{width:100%}
+  .vplayer{background:#000;border:1px solid var(--border);border-radius:8px;min-height:360px;
+    display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden}
+  .vplayer img{max-width:100%;max-height:70vh;display:block}
+  .vplayer .empty{color:#888;font-size:13px}
+  .vbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:12px;color:var(--muted);font-size:12px}
+  .vbar .stat{font-family:var(--mono)}
+  .vbar .stat.live{color:var(--green)}
+  .vbar .stat.err{color:#ffb3ad}
+  .vctrl{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+  .vctrl label{display:flex;align-items:center;gap:6px;color:var(--text);font-size:12px}
+  .vctrl input[type=number]{width:70px}
+  .v-disabled{color:#ffb3ad;background:#2a1414;border:1px solid #5c2b2b;border-radius:7px;padding:10px 12px;font-size:13px;margin-bottom:12px}
 </style>
 </head>
 <body>
@@ -222,6 +254,7 @@
   <button data-tab="infer" class="active">推理</button>
   <button data-tab="pool">采集池</button>
   <button data-tab="validate">验证</button>
+  <button data-tab="video">视频源</button>
 </nav>
 
 <main>
@@ -331,6 +364,42 @@
 
     <div id="vResults"></div>
   </section>
+
+  <!-- 视频源 -->
+  <section id="tab-video" style="display:none">
+    <div class="panel">
+      <div id="vDisabled" class="v-disabled" style="display:none"></div>
+      <div class="vctrl">
+        <label>抽帧 fps <input type="number" id="vFps" value="5" min="1" max="30" step="1"></label>
+        <label>最大宽 <input type="number" id="vMaxw" value="960" min="320" max="1920" step="80"></label>
+        <button class="btn primary" id="vStart">开始</button>
+        <button class="btn" id="vStop">停止</button>
+        <span style="color:var(--muted);font-size:12px">纯播放，仅临时预览，不导出、不存盘</span>
+      </div>
+
+      <div class="vlayout">
+        <div>
+          <div class="vsources" id="vSources"><div class="empty">加载中…</div></div>
+          <div class="vadd">
+            <input type="text" id="vUrl" placeholder="自定义 RTSP/HLS/HTTP 地址…">
+            <button class="btn" id="vUseUrl">播放此地址</button>
+            <label class="pick" id="pickVideo" style="margin:0">
+              <div class="t">上传本地视频文件</div>
+              <div class="n" id="vFileName">mp4/mov/mkv/avi/webm · 临时预览，看完即弃</div>
+              <input type="file" id="vFile" accept="video/*">
+            </label>
+          </div>
+        </div>
+        <div>
+          <div class="vplayer" id="vPlayer"><div class="empty" id="vPh">选择一个视频源并点「开始」（双击源也可直接播放）</div></div>
+          <div class="vbar">
+            <span class="stat" id="vStatus">未开始</span>
+            <span id="vSourceName" style="color:var(--muted)"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
 </main>
 
 <!-- 校验进行中遮罩 -->
@@ -383,6 +452,7 @@ async function loadEngines(){
 }
 function renderEngines(){
   const el = $('#engines');
+  if(!el) return;
   if(!engines.length){ el.innerHTML = '<span style="color:var(--muted);font-size:12px">无引擎</span>'; return; }
   if(!engines.find(e=>e.name===currentEngine)) currentEngine = engines[0].name;
   el.innerHTML = engines.map(e=>`
@@ -404,8 +474,10 @@ document.querySelectorAll('nav.tabs button').forEach(b=>{
     $('#tab-infer').style.display = t==='infer'?'block':'none';
     $('#tab-pool').style.display = t==='pool'?'block':'none';
     $('#tab-validate').style.display = t==='validate'?'block':'none';
+    $('#tab-video').style.display = t==='video'?'block':'none';
     if(t==='pool') loadPool();
     if(t==='validate') loadValTestsets();
+    if(t==='video') loadVideoSources();
   };
 });
 
@@ -713,6 +785,124 @@ function renderValReport(rep){
     </div>`;
   }).join('') + '</div>';
 }
+
+// ---------- 视频源（纯播放，不做推理） ----------
+const VCAT = {demo:'演示流', tv:'电视直播', nature:'自然风光', traffic:'监控/交通'};
+const VCAT_ORDER = ['demo','tv','nature','traffic'];
+let vSources = [], vSelectedSrc = '', vRunning = false, vFrame = null;
+
+async function loadVideoSources(){
+  try{
+    const r = await fetch('/api/video/sources');
+    const d = await r.json();
+    if(!d.enabled){
+      $('#vDisabled').style.display = 'block';
+      $('#vDisabled').textContent = '视频源未开启：服务端未找到 ffmpeg（用 -video-ffmpeg 指定路径后重启）。';
+      $('#vSources').innerHTML = '<div class="empty">不可用</div>';
+      return;
+    }
+    $('#vDisabled').style.display = 'none';
+    vSources = d.sources || [];
+    renderVSources();
+  }catch(err){
+    $('#vSources').innerHTML = `<div class="empty">加载失败: ${esc(err.message)}</div>`;
+  }
+}
+function renderVSources(){
+  const el = $('#vSources');
+  if(!vSources.length){ el.innerHTML = '<div class="empty">无内置源，用下方自定义地址</div>'; return; }
+  // 按分类分组，未知分类归到最后。
+  const groups = {};
+  vSources.forEach(s=>{
+    const c = VCAT[s.category] ? s.category : 'other';
+    (groups[c] = groups[c] || []).push(s);
+  });
+  const order = VCAT_ORDER.filter(c=>groups[c]);
+  if(groups.other) order.push('other');
+  let html = '';
+  order.forEach(c=>{
+    const label = VCAT[c] || '其他';
+    html += `<div class="vcat">${esc(label)}（${groups[c].length}）</div>`;
+    html += groups[c].map(s=>`
+      <div class="vsrc ${vSelectedSrc===s.id?'active':''}" data-id="${esc(s.id)}" title="双击播放">
+        <div class="n"><span class="k">${esc(s.kind)}</span>${esc(s.name)}${s.best_effort?'<span class="be">可能失效</span>':''}</div>
+        ${s.note?`<div class="note">${esc(s.note)}</div>`:''}
+      </div>`).join('');
+  });
+  el.innerHTML = html;
+  el.querySelectorAll('.vsrc').forEach(c=>{
+    c.onclick=()=>{
+      vSelectedSrc = c.dataset.id;
+      $('#vUrl').value = '';
+      renderVSources();
+      const s = vSources.find(x=>x.id===vSelectedSrc);
+      $('#vSourceName').textContent = s ? s.name : '';
+    };
+    c.ondblclick=()=>{ c.onclick(); startVideo(); };
+  });
+}
+function setVStatus(txt, cls){
+  const st = $('#vStatus');
+  st.textContent = txt;
+  st.className = 'stat' + (cls?(' '+cls):'');
+}
+function startVideo(){
+  if(vRunning) return;
+  let src = '', name = '';
+  const url = $('#vUrl').value.trim();
+  if(url){ src = 'url:' + url; name = url; }
+  else if(vSelectedSrc){ src = vSelectedSrc; name = $('#vSourceName').textContent; }
+  else { setVStatus('请先选择视频源或填写地址','err'); return; }
+
+  const params = new URLSearchParams({
+    src, fps: $('#vFps').value, maxw: $('#vMaxw').value,
+  });
+  const img = new Image();
+  setVStatus('连接中…','');
+  $('#vSourceName').textContent = name;
+  let gotFrame = false;
+  img.onload = ()=>{ gotFrame = true; setVStatus('播放中','live'); };
+  // MJPEG 用 <img> 播放，出错时浏览器不暴露 HTTP 状态码；服务端日志会记录真实原因。
+  img.onerror = ()=>{
+    stopVideo();
+    setVStatus(gotFrame ? '流已结束/中断' : '无法连接（源失效、会话已满或 ffmpeg 报错，见服务端日志）', 'err');
+  };
+  $('#vPlayer').innerHTML = '';
+  $('#vPlayer').appendChild(img);
+  vFrame = img;
+  vRunning = true;
+  // 加时间戳避免浏览器缓存旧流。
+  img.src = '/api/video/stream?' + params.toString() + '&_t=' + Date.now();
+}
+function stopVideo(){
+  if(vFrame){ try{ vFrame.src = ''; }catch(e){} vFrame.remove(); vFrame = null; }
+  vRunning = false;
+  $('#vPlayer').innerHTML = '<div class="empty" id="vPh">已停止</div>';
+  setVStatus('已停止','');
+}
+$('#vStart').onclick = startVideo;
+$('#vStop').onclick = stopVideo;
+$('#vUseUrl').onclick = ()=>{ if($('#vUrl').value.trim()){ vSelectedSrc=''; renderVSources(); startVideo(); } };
+$('#pickVideo').addEventListener('click',()=>$('#vFile').value='');
+$('#vFile').onchange = async ()=>{
+  const f = $('#vFile').files[0];
+  if(!f) return;
+  $('#vFileName').textContent = f.name;
+  $('#pickVideo').classList.add('has');
+  const fd = new FormData(); fd.append('video', f);
+  setVStatus('上传中…','');
+  try{
+    const r = await fetch('/api/video/upload',{method:'POST',body:fd});
+    if(!r.ok) throw new Error(await r.text());
+    const ref = await r.json();
+    vSelectedSrc = 'upload:'+ref.id;
+    $('#vSourceName').textContent = ref.name;
+    renderVSources();
+    startVideo();
+  }catch(err){
+    setVStatus('上传失败：'+err.message,'err');
+  }
+};
 
 // ---------- init ----------
 loadEngines();

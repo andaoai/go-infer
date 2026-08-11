@@ -36,6 +36,7 @@ type Server struct {
 	recorder       Recorder
 	browser        CaptureBrowser
 	validator      Validator
+	video          VideoService
 	maxUploadBytes int64
 }
 
@@ -115,6 +116,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/captures/file", s.handleCaptureFile)
 	s.mux.HandleFunc("/api/validate/testsets", s.handleValidateTestsets)
 	s.mux.HandleFunc("/api/validate", s.handleValidate)
+	s.mux.HandleFunc("/api/video/sources", s.handleVideoSources)
+	s.mux.HandleFunc("/api/video/upload", s.handleVideoUpload)
+	s.mux.HandleFunc("/api/video/stream", s.handleVideoStream)
 	s.mux.Handle("/", staticHandler())
 }
 
@@ -353,6 +357,16 @@ func (s *statusWriter) WriteHeader(c int) {
 	s.status = c
 	s.ResponseWriter.WriteHeader(c)
 }
+
+// Flush 透传给底层 ResponseWriter，使 MJPEG 等流式响应能逐帧刷新。
+func (s *statusWriter) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Unwrap 让 http.NewResponseController/类型断言能访问底层连接能力。
+func (s *statusWriter) Unwrap() http.ResponseWriter { return s.ResponseWriter }
 
 // ---------- 检测结果可视化 ----------
 

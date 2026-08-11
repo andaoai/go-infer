@@ -54,8 +54,15 @@ func main() {
 		validateDir   = flag.String("validate-dir", "runs/validate", "网页校验的临时文件目录（上传模型/数据集解压）")
 		validateMaxUp = flag.String("validate-max-upload", "2GB", "校验上传体积上限（模型+数据集，如 500MB/2GB）")
 		validateTests = &testsetFlag{}
+
+		videoFFmpeg  = flag.String("video-ffmpeg", "ffmpeg", "ffmpeg 可执行文件路径；找不到则视频 tab 自动关闭")
+		videoScratch = flag.String("video-scratch", "runs/video", "视频上传临时目录")
+		videoMaxSess = flag.Int("video-max-sessions", 3, "并发视频推理会话上限")
+		videoMaxUp   = flag.String("video-max-upload", "1GB", "上传视频体积上限（如 500MB/1GB）")
+		videoSources = &videoSourceFlag{}
 	)
 	flag.Var(validateTests, "validate-testset", "网页可选默认测试集，格式 name=path:split；可重复指定")
+	flag.Var(videoSources, "video-source", "网页视频源，格式 name=url；可重复指定（同内置名则覆盖）")
 	flag.Parse()
 
 	if lib := ortenv.FindLib(*ortLib); lib != "" {
@@ -134,6 +141,23 @@ func main() {
 		cleanupStaleScratch(*validateDir)
 		log.Printf("网页校验已开启: scratch=%s max-upload=%s testsets=%d",
 			*validateDir, *validateMaxUp, len(vs.Testsets()))
+	}
+
+	// 网页视频源（ffmpeg 抽帧 → 引擎推理 → MJPEG 实时预览；不导出、不落盘）。
+	vidMaxUp, err := parseSize(*videoMaxUp)
+	if err != nil {
+		log.Fatalf("解析 -video-max-upload: %v", err)
+	}
+	if vs, err := newVideoService(*videoFFmpeg, *videoScratch, vidMaxUp, *videoMaxSess, videoSources.list()); err != nil {
+		log.Fatalf("初始化视频服务: %v", err)
+	} else {
+		srv.SetVideo(vs)
+		if vs.Enabled() {
+			log.Printf("网页视频源已开启: ffmpeg=%s scratch=%s max-sessions=%d max-upload=%s",
+				*videoFFmpeg, *videoScratch, *videoMaxSess, *videoMaxUp)
+		} else {
+			log.Printf("网页视频源已禁用：未在 %q 找到 ffmpeg，视频 tab 将提示不可用", *videoFFmpeg)
+		}
 	}
 
 	log.Printf("go-infer 服务启动于 %s | 默认引擎=%s task=%s framework=%s classes=%d",
