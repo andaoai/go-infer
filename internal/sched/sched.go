@@ -401,6 +401,18 @@ func (s *Scheduler) finishPrepared(pj *preparedJob, res engine.Result, err error
 	s.finishJob(pj.job, res, err)
 }
 
+// drainJobs 把 jobs 通道中剩余的请求全部以 ErrClosed 收尾（worker 已退出后调用）。
+func (s *Scheduler) drainJobs() {
+	for {
+		select {
+		case j := <-s.jobs:
+			j.resolve(nil, engine.ErrClosed)
+		default:
+			return
+		}
+	}
+}
+
 // Close 停止接收新请求并等待 worker/batcher 退出。可重复调用。
 // 注意：Close 只停调度器自身的 goroutine，不关闭被包装引擎（由外层按
 // 先 Close 调度器、再 Close 引擎的顺序管理生命周期）。
@@ -410,15 +422,7 @@ func (s *Scheduler) Close() error {
 		close(s.done) // 通知所有 goroutine 停止；jobs 刻意不关闭，避免与 Run 的发送竞争
 		s.wgWorker.Wait()
 		// worker 都已退出，把队列里没被取走的请求以 ErrClosed 收尾，避免调用方永挂。
-		for {
-			select {
-			case j := <-s.jobs:
-				j.resolve(nil, engine.ErrClosed)
-			default:
-				goto drained
-			}
-		}
-	drained:
+		s.drainJobs()
 		if s.batch != nil {
 			// prepared 不再有生产者；关闭后 batcher 排空剩余项后退出。
 			close(s.prepared)
