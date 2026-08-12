@@ -13,13 +13,12 @@ package seg
 import (
 	"context"
 	"fmt"
-	"image"
 	"math"
-	"sync"
 	"time"
 
 	"github.com/andaoai/go-infer/internal/engine"
-	"github.com/andaoai/go-infer/internal/engines/onnxruntime/ortutil"
+	"github.com/andaoai/go-infer/internal/engines/onnxruntime/ortbatch"
+	"github.com/andaoai/go-infer/internal/postprocess"
 	"github.com/andaoai/go-infer/internal/preprocess"
 	ort "github.com/yalue/onnxruntime_go"
 )
@@ -38,31 +37,17 @@ type Config struct {
 	MaxBatch int
 }
 
-// segMeta 是每个预处理项的引擎私有元信息。
-type segMeta struct {
-	scale float32
-	padX  float32
-	padY  float32
-	orig  image.Rectangle
-	conf  float32
-}
-
 // Engine 是 engine.Engine / engine.BatchEngine 的 ONNX Runtime YOLOv8-seg 实现。
+// 输入缓冲、session、pool 与设备锁由内嵌的 *ortbatch.Runtime 管理；本结构只保留
+// 检测头/原型输出形状与输出缓冲。
 type Engine struct {
-	cfg   Config
-	runMu sync.Mutex // 共享批缓冲与 session，RunBatch 串行
+	*ortbatch.Runtime
+	cfg Config
 
-	session *ort.DynamicAdvancedSession
-
-	maxBatch    int
-	planeSize   int // 3*H*W，每图输入元素数
-	detStride   int // anchors*attrs，每图检测头元素数
-	protoStride int // nm*mh*mw，每图原型元素数
-
-	inputBuf []float32 // maxBatch*planeSize
-	detBuf   []float32 // maxBatch*detStride
-	protoBuf []float32 // maxBatch*protoStride
-	pool     sync.Pool // 借出 []float32，len=planeSize
+	detBuf      []float32 // maxBatch*detStride
+	protoBuf    []float32 // maxBatch*protoStride
+	detStride   int       // anchors*attrs，每图检测头元素数
+	protoStride int       // nm*mh*mw，每图原型元素数
 
 	// 检测头布局
 	anchors    int
@@ -117,40 +102,29 @@ func New(cfg Config) (*Engine, error) {
 		return nil, err
 	}
 
-	maxBatch, err := ortutil.ResolveMaxBatch(inputs[0].Dimensions, cfg.MaxBatch)
+	rt, err := ortbatch.New(ortbatch.Config{
+		ModelPath:   cfg.ModelPath,
+		InputNames:  []string{inputs[0].Name},
+		OutputNames: []string{detInfo.Name, protoInfo.Name},
+		InputDims:   inputs[0].Dimensions,
+		W:           cfg.InputW,
+		H:           cfg.InputH,
+		MaxBatch:    cfg.MaxBatch,
+		DefaultConf: cfg.ConfThresh,
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	options, err := ort.NewSessionOptions()
-	if err != nil {
-		return nil, fmt.Errorf("session options: %w", err)
-	}
-	defer options.Destroy()
-
-	session, err := ort.NewDynamicAdvancedSession(
-		cfg.ModelPath,
-		[]string{inputs[0].Name},
-		[]string{detInfo.Name, protoInfo.Name},
-		options,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("create session: %w", err)
-	}
-
-	planeSize := 3 * cfg.InputH * cfg.InputW
 	detStride := anchors * attrs
 	protoStride := nm * mh * mw
-	e := &Engine{
+	return &Engine{
+		Runtime:     rt,
 		cfg:         cfg,
-		session:     session,
-		maxBatch:    maxBatch,
-		planeSize:   planeSize,
+		detBuf:      make([]float32, rt.MaxBatch()*detStride),
+		protoBuf:    make([]float32, rt.MaxBatch()*protoStride),
 		detStride:   detStride,
 		protoStride: protoStride,
-		inputBuf:    make([]float32, maxBatch*planeSize),
-		detBuf:      make([]float32, maxBatch*detStride),
-		protoBuf:    make([]float32, maxBatch*protoStride),
 		anchors:     anchors,
 		attrs:       attrs,
 		nc:          nc,
@@ -158,90 +132,25 @@ func New(cfg Config) (*Engine, error) {
 		transposed:  transposed,
 		maskH:       mh,
 		maskW:       mw,
-	}
-	e.pool.New = func() any { return make([]float32, planeSize) }
-	return e, nil
+	}, nil
 }
 
 func (e *Engine) Name() string      { return e.cfg.Name }
 func (e *Engine) Task() engine.Task { return engine.TaskSegmentation }
 func (e *Engine) Framework() string { return "onnxruntime" }
-func (e *Engine) MaxBatch() int     { return e.maxBatch }
-
-// Prepare 在设备锁之外完成一张图的 letterbox/归一化。
-func (e *Engine) Prepare(ctx context.Context, req *engine.Request) (*engine.Prepared, error) {
-	if req.Image == nil {
-		return nil, fmt.Errorf("segmentation requires an image")
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	conf := e.cfg.ConfThresh
-	if v, ok := req.Params["conf"]; ok && v > 0 {
-		conf = v
-	}
-	buf := e.pool.Get().([]float32)
-	lb := preprocess.Letterbox(req.Image, e.cfg.InputW, e.cfg.InputH)
-	preprocess.FillNCHW(buf, lb.RGBA, e.cfg.InputW, e.cfg.InputH)
-	return &engine.Prepared{
-		Input: buf,
-		Meta: &segMeta{
-			scale: lb.Scale, padX: lb.PadX, padY: lb.PadY,
-			orig: req.Image.Bounds(), conf: conf,
-		},
-	}, nil
-}
-
-// Release 归还 Prepare 借出的缓冲，对 nil 安全、可重复调用。
-func (e *Engine) Release(p *engine.Prepared) {
-	if p == nil || p.Input == nil {
-		return
-	}
-	e.pool.Put(p.Input)
-	p.Input = nil
-}
 
 // Run 是单图便捷路径。
 func (e *Engine) Run(ctx context.Context, req *engine.Request) (engine.Result, error) {
-	p, err := e.Prepare(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	defer e.Release(p)
-	results, err := e.RunBatch(ctx, []*engine.Prepared{p})
-	if err != nil {
-		return nil, err
-	}
-	return results[0], nil
+	return e.Runtime.RunOnce(ctx, req, e.buildOutput, e.postSlot)
 }
 
-// RunBatch 在一次底层推理中处理 n 张图，返回等长结果。
+// RunBatch 在一次底层推理中处理 n 张已预处理的图。
 func (e *Engine) RunBatch(ctx context.Context, batch []*engine.Prepared) ([]engine.Result, error) {
-	n := len(batch)
-	if n == 0 || n > e.maxBatch {
-		return nil, fmt.Errorf("invalid batch size %d (max %d)", n, e.maxBatch)
-	}
+	return e.Runtime.RunBatch(ctx, batch, e.buildOutput, e.postSlot)
+}
 
-	e.runMu.Lock()
-	defer e.runMu.Unlock()
-
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	for i, p := range batch {
-		copy(e.inputBuf[i*e.planeSize:(i+1)*e.planeSize], p.Input)
-	}
-
-	in, err := ort.NewTensor(
-		ort.NewShape(int64(n), 3, int64(e.cfg.InputH), int64(e.cfg.InputW)),
-		e.inputBuf[:n*e.planeSize],
-	)
-	if err != nil {
-		return nil, fmt.Errorf("create input tensor: %w", err)
-	}
-	defer in.Destroy()
-
+// buildOutput 在引擎自有 detBuf/protoBuf 上按本次 batch n 构造检测头与原型两个输出张量。
+func (e *Engine) buildOutput(n int) (ortbatch.Output, error) {
 	var detShape ort.Shape
 	if e.transposed {
 		detShape = ort.NewShape(int64(n), int64(e.anchors), int64(e.attrs))
@@ -250,34 +159,29 @@ func (e *Engine) RunBatch(ctx context.Context, batch []*engine.Prepared) ([]engi
 	}
 	detOut, err := ort.NewTensor(detShape, e.detBuf[:n*e.detStride])
 	if err != nil {
-		return nil, fmt.Errorf("create det tensor: %w", err)
+		return ortbatch.Output{}, fmt.Errorf("create det tensor: %w", err)
 	}
-	defer detOut.Destroy()
-
 	protoTensor, err := ort.NewTensor(
 		ort.NewShape(int64(n), int64(e.nm), int64(e.maskH), int64(e.maskW)),
 		e.protoBuf[:n*e.protoStride],
 	)
 	if err != nil {
-		return nil, fmt.Errorf("create proto tensor: %w", err)
+		detOut.Destroy()
+		return ortbatch.Output{}, fmt.Errorf("create proto tensor: %w", err)
 	}
-	defer protoTensor.Destroy()
+	return ortbatch.Output{
+		Values: []ort.Value{detOut, protoTensor},
+		Done:   func() { detOut.Destroy(); protoTensor.Destroy() },
+	}, nil
+}
 
-	start := time.Now()
-	if err := e.session.Run([]ort.Value{in}, []ort.Value{detOut, protoTensor}); err != nil {
-		return nil, fmt.Errorf("inference: %w", err)
-	}
-	inferElapsed := time.Since(start)
-
-	results := make([]engine.Result, n)
-	for i, p := range batch {
-		m := p.Meta.(*segMeta)
-		cands := e.decodeDetections(i, m.conf)
-		kept := e.nms(cands)
-		instances := e.makeMasks(i, kept, m)
-		results[i] = &engine.SegmentationResult{Elapsed: inferElapsed, Instances: instances}
-	}
-	return results, nil
+// postSlot 对第 slot 个输出解码、NMS、生成掩膜并映射回原图。
+func (e *Engine) postSlot(slot int, p *engine.Prepared, elapsed time.Duration) (engine.Result, error) {
+	m := p.Meta.(*ortbatch.Meta)
+	cands := e.decodeDetections(slot, m.Conf)
+	kept := e.nms(cands)
+	instances := e.makeMasks(slot, kept, m)
+	return &engine.SegmentationResult{Elapsed: elapsed, Instances: instances}, nil
 }
 
 type cand struct {
@@ -339,7 +243,8 @@ func (e *Engine) decodeDetections(slot int, conf float32) []cand {
 }
 
 func (e *Engine) nms(cands []cand) []cand {
-	// 按置信度降序稳定排序，同类 IoU 超阈值则抑制。候选数量小，插入排序即可。
+	// 候选携带掩膜系数，不能直接用 postprocess.NMS；按置信度降序稳定排序，
+	// 同类 IoU 超阈值则抑制，IoU 复用 postprocess.IoU。
 	for i := 1; i < len(cands); i++ {
 		for j := i; j > 0 && cands[j-1].box.Confidence < cands[j].box.Confidence; j-- {
 			cands[j-1], cands[j] = cands[j], cands[j-1]
@@ -352,19 +257,11 @@ func (e *Engine) nms(cands []cand) []cand {
 			continue
 		}
 		keep = append(keep, cands[i])
-		bi := preprocess.NMSBox{
-			ClassID: cands[i].box.ClassID, Confidence: cands[i].box.Confidence,
-			X1: cands[i].box.X1, Y1: cands[i].box.Y1, X2: cands[i].box.X2, Y2: cands[i].box.Y2,
-		}
 		for j := i + 1; j < len(cands); j++ {
 			if suppressed[j] || cands[j].box.ClassID != cands[i].box.ClassID {
 				continue
 			}
-			bj := preprocess.NMSBox{
-				ClassID: cands[j].box.ClassID, Confidence: cands[j].box.Confidence,
-				X1: cands[j].box.X1, Y1: cands[j].box.Y1, X2: cands[j].box.X2, Y2: cands[j].box.Y2,
-			}
-			if preprocess.IoU(bi, bj) > e.cfg.IoUThresh {
+			if postprocess.IoU(cands[i].box, cands[j].box) > e.cfg.IoUThresh {
 				suppressed[j] = true
 			}
 		}
@@ -373,8 +270,8 @@ func (e *Engine) nms(cands []cand) []cand {
 }
 
 // makeMasks 对每个保留实例计算二值掩膜、追踪轮廓并映射回原图。
-func (e *Engine) makeMasks(slot int, cands []cand, m *segMeta) []engine.Instance {
-	origW, origH := float32(m.orig.Dx()), float32(m.orig.Dy())
+func (e *Engine) makeMasks(slot int, cands []cand, m *ortbatch.Meta) []engine.Instance {
+	origW, origH := float32(m.Orig.Dx()), float32(m.Orig.Dy())
 	inW, inH := float32(e.cfg.InputW), float32(e.cfg.InputH)
 	mW, mH := float32(e.maskW), float32(e.maskH)
 	sx, sy := mW/inW, mH/inH
@@ -415,8 +312,8 @@ func (e *Engine) makeMasks(slot int, cands []cand, m *segMeta) []engine.Instance
 			for _, p := range poly {
 				gx := float32(p.x) + ix1
 				gy := float32(p.y) + iy1
-				ox := preprocess.Clamp((gx-m.padX)/m.scale, 0, origW)
-				oy := preprocess.Clamp((gy-m.padY)/m.scale, 0, origH)
+				ox := preprocess.Clamp((gx-m.PadX)/m.Scale, 0, origW)
+				oy := preprocess.Clamp((gy-m.PadY)/m.Scale, 0, origH)
 				mp = append(mp, engine.Point{X: ox, Y: oy})
 			}
 			mapped = append(mapped, mp)
@@ -426,10 +323,10 @@ func (e *Engine) makeMasks(slot int, cands []cand, m *segMeta) []engine.Instance
 		if b.ClassID < len(e.cfg.Classes) {
 			name = e.cfg.Classes[b.ClassID]
 		}
-		x1 := preprocess.Clamp((b.X1-m.padX)/m.scale, 0, origW)
-		y1 := preprocess.Clamp((b.Y1-m.padY)/m.scale, 0, origH)
-		x2 := preprocess.Clamp((b.X2-m.padX)/m.scale, 0, origW)
-		y2 := preprocess.Clamp((b.Y2-m.padY)/m.scale, 0, origH)
+		x1 := preprocess.Clamp((b.X1-m.PadX)/m.Scale, 0, origW)
+		y1 := preprocess.Clamp((b.Y1-m.PadY)/m.Scale, 0, origH)
+		x2 := preprocess.Clamp((b.X2-m.PadX)/m.Scale, 0, origW)
+		y2 := preprocess.Clamp((b.Y2-m.PadY)/m.Scale, 0, origH)
 
 		instances = append(instances, engine.Instance{
 			Detection: engine.Detection{
@@ -489,13 +386,6 @@ func (e *Engine) sampleProto(slot int, mx, my float32, coeffs []float32) float32
 
 func sigmoid(x float32) float32 {
 	return 1.0 / (1.0 + float32(math.Exp(float64(-x))))
-}
-
-func (e *Engine) Close() error {
-	if e.session != nil {
-		return e.session.Destroy()
-	}
-	return nil
 }
 
 // ---------- 输出形状解析 ----------

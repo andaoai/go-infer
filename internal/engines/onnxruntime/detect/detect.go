@@ -5,19 +5,18 @@
 //   - 输出:  官方 [N,4+nc,anchors] 或转置 [N,anchors,4+nc]
 //
 // N 由模型输入 batch 维决定：固定 1 则只能单图；动态维则可在配置上限内
-// 合批。预处理（letterbox/归一化）在 Prepare 中于设备锁之外完成，RunBatch
-// 只做拷贝、建张量、推理、后处理，供 sched 做流水线与 dynamic batching。
+// 合批。预处理与批处理运行时由内嵌的 ortbatch.Runtime 提供，本包只负责输出
+// 形状解析、输出张量构造与逐槽后处理。
 package detect
 
 import (
 	"context"
 	"fmt"
-	"image"
-	"sync"
 	"time"
 
 	"github.com/andaoai/go-infer/internal/engine"
-	"github.com/andaoai/go-infer/internal/engines/onnxruntime/ortutil"
+	"github.com/andaoai/go-infer/internal/engines/onnxruntime/ortbatch"
+	"github.com/andaoai/go-infer/internal/postprocess"
 	"github.com/andaoai/go-infer/internal/preprocess"
 	ort "github.com/yalue/onnxruntime_go"
 )
@@ -36,30 +35,15 @@ type Config struct {
 	MaxBatch int
 }
 
-// detMeta 是每个预处理项的引擎私有元信息，只含标量，不引用借出的缓冲。
-type detMeta struct {
-	scale float32
-	padX  float32
-	padY  float32
-	orig  image.Rectangle
-	conf  float32
-}
-
 // Engine 是 engine.Engine / engine.BatchEngine 的 ONNX Runtime YOLO 实现。
+// 输入缓冲、session、pool 与设备锁由内嵌的 *ortbatch.Runtime 管理；本结构只保留
+// 输出形状与输出缓冲。
 type Engine struct {
-	cfg   Config
-	runMu sync.Mutex // 共享批缓冲与 session，RunBatch 串行
+	*ortbatch.Runtime
+	cfg Config
 
-	session *ort.DynamicAdvancedSession
-
-	maxBatch  int
-	planeSize int // 3*H*W，每图输入元素数
-	outStride int // anchors*attrs，每图输出元素数
-
-	inputBuf  []float32 // maxBatch*planeSize
-	outputBuf []float32 // maxBatch*outStride
-	pool      sync.Pool // 借出 []float32，len=planeSize
-
+	outputBuf     []float32 // maxBatch*outStride
+	outStride     int       // anchors*attrs，每图输出元素数
 	outAnchors    int
 	outAttrs      int // 4 + nc
 	outTransposed bool
@@ -94,156 +78,70 @@ func New(cfg Config) (*Engine, error) {
 		return nil, err
 	}
 
-	maxBatch, err := ortutil.ResolveMaxBatch(inInfo.Dimensions, cfg.MaxBatch)
+	rt, err := ortbatch.New(ortbatch.Config{
+		ModelPath:   cfg.ModelPath,
+		InputNames:  []string{inInfo.Name},
+		OutputNames: []string{outInfo.Name},
+		InputDims:   inInfo.Dimensions,
+		W:           cfg.InputW,
+		H:           cfg.InputH,
+		MaxBatch:    cfg.MaxBatch,
+		DefaultConf: cfg.ConfThresh,
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	options, err := ort.NewSessionOptions()
-	if err != nil {
-		return nil, fmt.Errorf("session options: %w", err)
-	}
-	defer options.Destroy()
-
-	session, err := ort.NewDynamicAdvancedSession(
-		cfg.ModelPath,
-		[]string{inInfo.Name},
-		[]string{outInfo.Name},
-		options,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("create session: %w", err)
-	}
-
-	planeSize := 3 * cfg.InputH * cfg.InputW
 	outStride := anchors * attrs
-	e := &Engine{
+	return &Engine{
+		Runtime:       rt,
 		cfg:           cfg,
-		session:       session,
-		maxBatch:      maxBatch,
-		planeSize:     planeSize,
+		outputBuf:     make([]float32, rt.MaxBatch()*outStride),
 		outStride:     outStride,
-		inputBuf:      make([]float32, maxBatch*planeSize),
-		outputBuf:     make([]float32, maxBatch*outStride),
 		outAnchors:    anchors,
 		outAttrs:      attrs,
 		outTransposed: transposed,
-	}
-	e.pool.New = func() any { return make([]float32, planeSize) }
-	return e, nil
+	}, nil
 }
 
 func (e *Engine) Name() string      { return e.cfg.Name }
 func (e *Engine) Task() engine.Task { return engine.TaskDetection }
 func (e *Engine) Framework() string { return "onnxruntime" }
-func (e *Engine) MaxBatch() int     { return e.maxBatch }
 
-// Prepare 在设备锁之外完成一张图的 letterbox/归一化，借出缓冲由 Release 归还。
-func (e *Engine) Prepare(ctx context.Context, req *engine.Request) (*engine.Prepared, error) {
-	if req.Image == nil {
-		return nil, fmt.Errorf("detection requires an image")
+// Run 是单图便捷路径。
+func (e *Engine) Run(ctx context.Context, req *engine.Request) (engine.Result, error) {
+	return e.Runtime.RunOnce(ctx, req, e.buildOutput, e.postSlot)
+}
+
+// RunBatch 在一次底层推理中处理 n 张已预处理的图。
+func (e *Engine) RunBatch(ctx context.Context, batch []*engine.Prepared) ([]engine.Result, error) {
+	return e.Runtime.RunBatch(ctx, batch, e.buildOutput, e.postSlot)
+}
+
+// buildOutput 在引擎自有 outputBuf 上按本次 batch n 构造输出张量。
+func (e *Engine) buildOutput(n int) (ortbatch.Output, error) {
+	var shape ort.Shape
+	if e.outTransposed {
+		shape = ort.NewShape(int64(n), int64(e.outAnchors), int64(e.outAttrs))
+	} else {
+		shape = ort.NewShape(int64(n), int64(e.outAttrs), int64(e.outAnchors))
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
+	out, err := ort.NewTensor(shape, e.outputBuf[:n*e.outStride])
+	if err != nil {
+		return ortbatch.Output{}, fmt.Errorf("create output tensor: %w", err)
 	}
-	conf := e.cfg.ConfThresh
-	if v, ok := req.Params["conf"]; ok && v > 0 {
-		conf = v
-	}
-	buf := e.pool.Get().([]float32)
-	lb := preprocess.Letterbox(req.Image, e.cfg.InputW, e.cfg.InputH)
-	preprocess.FillNCHW(buf, lb.RGBA, e.cfg.InputW, e.cfg.InputH)
-	return &engine.Prepared{
-		Input: buf,
-		Meta: &detMeta{
-			scale: lb.Scale,
-			padX:  lb.PadX,
-			padY:  lb.PadY,
-			orig:  req.Image.Bounds(),
-			conf:  conf,
-		},
+	return ortbatch.Output{
+		Values: []ort.Value{out},
+		Done:   func() { out.Destroy() },
 	}, nil
 }
 
-// Release 归还 Prepare 借出的缓冲，对 nil 安全、可重复调用。
-func (e *Engine) Release(p *engine.Prepared) {
-	if p == nil || p.Input == nil {
-		return
-	}
-	e.pool.Put(p.Input)
-	p.Input = nil
-}
-
-// Run 是单图便捷路径，等价于 Prepare + RunBatch(1) + Release。
-func (e *Engine) Run(ctx context.Context, req *engine.Request) (engine.Result, error) {
-	p, err := e.Prepare(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	defer e.Release(p)
-	results, err := e.RunBatch(ctx, []*engine.Prepared{p})
-	if err != nil {
-		return nil, err
-	}
-	return results[0], nil
-}
-
-// RunBatch 在一次底层推理中处理 n 张已预处理的图，返回等长结果。
-// n∈[1,MaxBatch]；整批成功或整批失败。后处理在锁内逐槽完成。
-func (e *Engine) RunBatch(ctx context.Context, batch []*engine.Prepared) ([]engine.Result, error) {
-	n := len(batch)
-	if n == 0 || n > e.maxBatch {
-		return nil, fmt.Errorf("invalid batch size %d (max %d)", n, e.maxBatch)
-	}
-
-	e.runMu.Lock()
-	defer e.runMu.Unlock()
-
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	// 拷贝各图输入到批缓冲。C 张量指向批缓冲，而非 per-request 缓冲，
-	// 因此 RunBatch 返回后调度器即可安全归还 per-request 缓冲。
-	for i, p := range batch {
-		copy(e.inputBuf[i*e.planeSize:(i+1)*e.planeSize], p.Input)
-	}
-
-	in, err := ort.NewTensor(
-		ort.NewShape(int64(n), 3, int64(e.cfg.InputH), int64(e.cfg.InputW)),
-		e.inputBuf[:n*e.planeSize],
-	)
-	if err != nil {
-		return nil, fmt.Errorf("create input tensor: %w", err)
-	}
-	defer in.Destroy()
-
-	var outShape ort.Shape
-	if e.outTransposed {
-		outShape = ort.NewShape(int64(n), int64(e.outAnchors), int64(e.outAttrs))
-	} else {
-		outShape = ort.NewShape(int64(n), int64(e.outAttrs), int64(e.outAnchors))
-	}
-	out, err := ort.NewTensor(outShape, e.outputBuf[:n*e.outStride])
-	if err != nil {
-		return nil, fmt.Errorf("create output tensor: %w", err)
-	}
-	defer out.Destroy()
-
-	start := time.Now()
-	if err := e.session.Run([]ort.Value{in}, []ort.Value{out}); err != nil {
-		return nil, fmt.Errorf("inference: %w", err)
-	}
-	inferElapsed := time.Since(start)
-
-	results := make([]engine.Result, n)
-	for i, p := range batch {
-		m := p.Meta.(*detMeta)
-		boxes := e.postprocess(i, m.conf)
-		detections := e.mapToImage(boxes, m)
-		results[i] = &engine.DetectionResult{Elapsed: inferElapsed, Detections: detections}
-	}
-	return results, nil
+// postSlot 对第 slot 个输出做解码、NMS 与坐标映射。
+func (e *Engine) postSlot(slot int, p *engine.Prepared, elapsed time.Duration) (engine.Result, error) {
+	m := p.Meta.(*ortbatch.Meta)
+	boxes := e.postprocess(slot, m.Conf)
+	detections := e.mapToImage(boxes, m)
+	return &engine.DetectionResult{Elapsed: elapsed, Detections: detections}, nil
 }
 
 // postprocess 解析第 slot 个输出，按类取最大分数并 NMS（按图独立，不跨图抑制）。
@@ -289,18 +187,18 @@ func (e *Engine) postprocess(slot int, conf float32) []engine.Box {
 			Y2:         cy + h/2,
 		})
 	}
-	return nms(cands, e.cfg.IoUThresh)
+	return postprocess.NMS(cands, e.cfg.IoUThresh)
 }
 
 // mapToImage 将 letterbox 坐标映射回原图并转为公共 Detection。
-func (e *Engine) mapToImage(boxes []engine.Box, m *detMeta) []engine.Detection {
-	w, h := float32(m.orig.Dx()), float32(m.orig.Dy())
+func (e *Engine) mapToImage(boxes []engine.Box, m *ortbatch.Meta) []engine.Detection {
+	w, h := float32(m.Orig.Dx()), float32(m.Orig.Dy())
 	out := make([]engine.Detection, 0, len(boxes))
 	for _, box := range boxes {
-		x1 := preprocess.Clamp((box.X1-m.padX)/m.scale, 0, w)
-		y1 := preprocess.Clamp((box.Y1-m.padY)/m.scale, 0, h)
-		x2 := preprocess.Clamp((box.X2-m.padX)/m.scale, 0, w)
-		y2 := preprocess.Clamp((box.Y2-m.padY)/m.scale, 0, h)
+		x1 := preprocess.Clamp((box.X1-m.PadX)/m.Scale, 0, w)
+		y1 := preprocess.Clamp((box.Y1-m.PadY)/m.Scale, 0, h)
+		x2 := preprocess.Clamp((box.X2-m.PadX)/m.Scale, 0, w)
+		y2 := preprocess.Clamp((box.Y2-m.PadY)/m.Scale, 0, h)
 		name := ""
 		if box.ClassID < len(e.cfg.Classes) {
 			name = e.cfg.Classes[box.ClassID]
@@ -313,13 +211,6 @@ func (e *Engine) mapToImage(boxes []engine.Box, m *detMeta) []engine.Detection {
 		})
 	}
 	return out
-}
-
-func (e *Engine) Close() error {
-	if e.session != nil {
-		return e.session.Destroy()
-	}
-	return nil
 }
 
 // parseOutputShape 将模型输出形状解析为 anchors/attrs/是否转置。

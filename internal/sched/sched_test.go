@@ -31,6 +31,7 @@ type fakeBatch struct {
 	batchSize []int
 
 	runGate chan struct{} // 非 nil 时 RunBatch 阻塞到此通道关闭
+	onRun   func()        // 可选：进入 RunBatch 后、阻塞前调用一次
 }
 
 func (f *fakeBatch) Name() string      { return f.name }
@@ -70,6 +71,9 @@ func (f *fakeBatch) Prepare(ctx context.Context, req *engine.Request) (*engine.P
 }
 
 func (f *fakeBatch) RunBatch(ctx context.Context, batch []*engine.Prepared) ([]engine.Result, error) {
+	if f.onRun != nil {
+		f.onRun()
+	}
 	if f.runGate != nil {
 		select {
 		case <-f.runGate:
@@ -419,6 +423,84 @@ func TestNilImageRejected(t *testing.T) {
 	if _, err := s.Run(context.Background(), &engine.Request{}); err == nil {
 		t.Fatal("want error for nil image")
 	}
+}
+
+func TestStatsRejectedBusy(t *testing.T) {
+	// worker 卡在 Prepare（不消费 jobs），queue=1：第 3 个请求立即 ErrBusy。
+	be := &fakeBatch{name: "fake", maxBatch: 1, prepareDur: 30 * time.Millisecond}
+	s := New(be, Config{Workers: 1, QueueDepth: 1})
+	defer s.Close()
+
+	go func() { _, _ = runCtx(s, "occupy") }()
+	time.Sleep(10 * time.Millisecond)
+	go func() { _, _ = runCtx(s, "queued") }()
+	time.Sleep(10 * time.Millisecond)
+	if _, err := runCtx(s, "overflow"); !errors.Is(err, engine.ErrBusy) {
+		t.Fatalf("want ErrBusy, got %v", err)
+	}
+	st := s.Snapshot()
+	if st.RejectedBusy != 1 {
+		t.Fatalf("want 1 rejected, got %d", st.RejectedBusy)
+	}
+	if st.Accepted != 2 {
+		t.Fatalf("want 2 accepted, got %d", st.Accepted)
+	}
+}
+
+func TestStatsInFlightAndBatches(t *testing.T) {
+	// 用 gate + onRun 屏障让请求真正进入 RunBatch，验证在飞/批次数/成功计数。
+	gate := make(chan struct{})
+	started := make(chan struct{}, 1)
+	be := &fakeBatch{name: "fake", maxBatch: 1, runGate: gate, onRun: func() {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+	}}
+	s := New(be, Config{Workers: 1, QueueDepth: 8})
+	defer s.Close()
+
+	if st := s.Snapshot(); st.Workers != 1 || st.QueueCap != 8 || st.MaxBatch != 1 {
+		t.Fatalf("unexpected initial stats: %+v", st)
+	}
+
+	done := make(chan error, 1)
+	go func() { _, err := runCtx(s, "a"); done <- err }()
+	<-started // a 已进入 RunBatch 并阻塞在 gate
+	waitFor(t, time.Second, func() bool { return s.Snapshot().InFlight == 1 })
+	if st := s.Snapshot(); st.Accepted != 1 || st.InFlight != 1 || st.Batches != 1 {
+		t.Fatalf("in-flight snapshot wrong: %+v", st)
+	}
+
+	close(gate)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("request did not return after gate opened")
+	}
+	waitFor(t, time.Second, func() bool { return s.Snapshot().InFlight == 0 })
+	st := s.Snapshot()
+	if st.Succeeded != 1 || st.Failed != 0 || st.Batches != 1 {
+		t.Fatalf("final snapshot wrong: %+v", st)
+	}
+	if st.RejectedBusy != 0 || st.QueueLen != 0 {
+		t.Fatalf("unexpected queue/reject: %+v", st)
+	}
+}
+
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("condition not met within timeout")
 }
 
 // plainEngine 是不实现 BatchEngine 的最小 Engine，用于回退路径测试。

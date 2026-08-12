@@ -144,17 +144,26 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "engines": len(s.engines)})
 }
 
-type engineInfo struct {
-	Name      string `json:"name"`
-	Task      string `json:"task"`
-	Framework string `json:"framework"`
+// statsProvider 由带可观测计数的引擎实现（如 *sched.Scheduler）。
+// api 不直接依赖 sched，通过本地鸭子接口解耦。
+type statsProvider interface {
+	Stats() any
 }
 
 func (s *Server) handleEngines(w http.ResponseWriter, r *http.Request) {
-	infos := make([]engineInfo, 0, len(s.order))
+	infos := make([]map[string]any, 0, len(s.order))
 	for _, name := range s.order {
 		e := s.engines[name]
-		infos = append(infos, engineInfo{Name: name, Task: string(e.Task()), Framework: e.Framework()})
+		info := map[string]any{
+			"name":      name,
+			"task":      string(e.Task()),
+			"framework": e.Framework(),
+		}
+		// 若引擎被调度器包装，附带背压/吞吐计数，便于调 -sched-queue。
+		if sp, ok := e.(statsProvider); ok {
+			info["stats"] = sp.Stats()
+		}
+		infos = append(infos, info)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"count": len(infos), "engines": infos})
 }

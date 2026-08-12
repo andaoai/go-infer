@@ -34,6 +34,21 @@ type Config struct {
 	MaxWait time.Duration
 }
 
+// Stats 是调度器某一时刻的可观测快照。
+type Stats struct {
+	Workers      int    `json:"workers"`       // worker 数
+	QueueLen     int    `json:"queue_len"`     // 排队中请求数
+	QueueCap     int    `json:"queue_cap"`     // 队列容量
+	InFlight     int64  `json:"in_flight"`     // 已被 worker 取走、尚未返回结果的请求数
+	MaxBatch     int    `json:"max_batch"`     // 实际生效的合批上限
+	Accepted     uint64 `json:"accepted"`      // 累计成功入队
+	RejectedBusy uint64 `json:"rejected_busy"` // 累计因队列满返回 ErrBusy
+	Succeeded    uint64 `json:"succeeded"`     // 累计成功返回结果
+	Failed       uint64 `json:"failed"`        // 累计返回错误（含客户端取消）
+	Panics       uint64 `json:"panics"`        // 累计 RunBatch panic（已恢复）
+	Batches      uint64 `json:"batches"`       // 累计执行的 RunBatch 次数
+}
+
 // Scheduler 包装一个 engine.Engine，提供并发调度。
 type Scheduler struct {
 	inner engine.Engine
@@ -48,6 +63,14 @@ type Scheduler struct {
 	done     chan struct{}     // Close 时关闭
 	wgWorker sync.WaitGroup
 	wgBatch  sync.WaitGroup
+
+	accepted     atomic.Uint64
+	rejectedBusy atomic.Uint64
+	succeeded    atomic.Uint64
+	failed       atomic.Uint64
+	panics       atomic.Uint64
+	batches      atomic.Uint64
+	inFlight     atomic.Int64
 
 	accepting atomic.Bool
 	stopOnce  sync.Once
@@ -78,6 +101,7 @@ type preparedJob struct {
 }
 
 func (pj *preparedJob) resolve(res engine.Result, err error) { pj.job.resolve(res, err) }
+func (pj *preparedJob) canceled() bool                       { return pj.job.ctx.Err() != nil }
 
 // New 构造调度器并启动 worker/batcher。调用方需在关闭时调用 Close。
 func New(inner engine.Engine, cfg Config) *Scheduler {
@@ -118,10 +142,16 @@ func New(inner engine.Engine, cfg Config) *Scheduler {
 		s.prepared = make(chan *preparedJob, workers+s.maxBatch)
 		s.wgBatch.Add(1)
 		go s.runBatcher()
-	}
-	s.wgWorker.Add(workers)
-	for i := 0; i < workers; i++ {
-		go s.runWorker()
+		s.wgWorker.Add(workers)
+		for i := 0; i < workers; i++ {
+			go s.runBatchWorker()
+		}
+	} else {
+		s.maxBatch = 1
+		s.wgWorker.Add(workers)
+		for i := 0; i < workers; i++ {
+			go s.runPlainWorker()
+		}
 	}
 	s.accepting.Store(true)
 	return s
@@ -131,6 +161,27 @@ func New(inner engine.Engine, cfg Config) *Scheduler {
 func (s *Scheduler) Name() string      { return s.inner.Name() }
 func (s *Scheduler) Task() engine.Task { return s.inner.Task() }
 func (s *Scheduler) Framework() string { return s.inner.Framework() }
+
+// Stats 返回调度器的瞬时计数快照（并发安全，不加锁）。返回 any 以让上层
+// （如 api 层）通过鸭子接口识别，而无需反向依赖 sched 包。
+func (s *Scheduler) Stats() any { return s.Snapshot() }
+
+// Snapshot 返回带类型的计数快照，供本包测试与内部调用方使用。
+func (s *Scheduler) Snapshot() Stats {
+	return Stats{
+		Workers:      s.workers,
+		QueueLen:     len(s.jobs),
+		QueueCap:     cap(s.jobs),
+		InFlight:     s.inFlight.Load(),
+		MaxBatch:     s.maxBatch,
+		Accepted:     s.accepted.Load(),
+		RejectedBusy: s.rejectedBusy.Load(),
+		Succeeded:    s.succeeded.Load(),
+		Failed:       s.failed.Load(),
+		Panics:       s.panics.Load(),
+		Batches:      s.batches.Load(),
+	}
+}
 
 // Run 入队一次推理请求。队列满返回 engine.ErrBusy，调度器关闭返回 engine.ErrClosed，
 // ctx 取消返回 ctx.Err。结果/错误来自被包装引擎。
@@ -144,9 +195,11 @@ func (s *Scheduler) Run(ctx context.Context, req *engine.Request) (engine.Result
 	j := &job{ctx: ctx, req: req, fut: make(chan resultOrErr, 1)}
 	select {
 	case s.jobs <- j:
+		s.accepted.Add(1)
 	case <-s.done:
 		return nil, engine.ErrClosed
 	default:
+		s.rejectedBusy.Add(1)
 		return nil, engine.ErrBusy
 	}
 	select {
@@ -158,39 +211,9 @@ func (s *Scheduler) Run(ctx context.Context, req *engine.Request) (engine.Result
 	}
 }
 
-func (s *Scheduler) runWorker() {
+// runBatchWorker 从 jobs 取请求、在设备锁之外并发 Prepare，再投递给 batcher。
+func (s *Scheduler) runBatchWorker() {
 	defer s.wgWorker.Done()
-	if s.batch != nil {
-		for {
-			var j *job
-			select {
-			case <-s.done:
-				return
-			case j = <-s.jobs:
-			}
-			if s.stopped() {
-				// 关闭期间只做必要的快速失败，不再浪费 CPU 预处理。
-				j.resolve(nil, engine.ErrClosed)
-				continue
-			}
-			if j.ctx.Err() != nil {
-				j.resolve(nil, j.ctx.Err())
-				continue
-			}
-			p, err := s.batch.Prepare(j.ctx, j.req)
-			if err != nil {
-				j.resolve(nil, err)
-				continue
-			}
-			pj := &preparedJob{job: j, p: p}
-			select {
-			case s.prepared <- pj:
-			case <-s.done:
-				s.batch.Release(p)
-				j.resolve(nil, engine.ErrClosed)
-			}
-		}
-	}
 	for {
 		var j *job
 		select {
@@ -198,12 +221,49 @@ func (s *Scheduler) runWorker() {
 			return
 		case j = <-s.jobs:
 		}
+		s.inFlight.Add(1)
 		if s.stopped() {
-			j.resolve(nil, engine.ErrClosed)
+			// 关闭期间只做必要的快速失败，不再浪费 CPU 预处理。
+			s.finishJob(j, nil, engine.ErrClosed)
+			continue
+		}
+		if err := j.ctx.Err(); err != nil {
+			s.finishJob(j, nil, err)
+			continue
+		}
+		p, err := s.batch.Prepare(j.ctx, j.req)
+		if err != nil {
+			s.finishJob(j, nil, err)
+			continue
+		}
+		pj := &preparedJob{job: j, p: p}
+		select {
+		case s.prepared <- pj:
+			// 移交 batcher：由 batcher 在交付结果时 finishJob 并 Release。
+		case <-s.done:
+			s.batch.Release(p)
+			s.finishJob(j, nil, engine.ErrClosed)
+		}
+	}
+}
+
+// runPlainWorker 服务不实现 BatchEngine 的引擎：直接并发调用 Run。
+func (s *Scheduler) runPlainWorker() {
+	defer s.wgWorker.Done()
+	for {
+		var j *job
+		select {
+		case <-s.done:
+			return
+		case j = <-s.jobs:
+		}
+		s.inFlight.Add(1)
+		if s.stopped() {
+			s.finishJob(j, nil, engine.ErrClosed)
 			continue
 		}
 		res, err := s.inner.Run(j.ctx, j.req)
-		j.resolve(res, err)
+		s.finishJob(j, res, err)
 	}
 }
 
@@ -216,6 +276,7 @@ func (s *Scheduler) stopped() bool {
 	}
 }
 
+// runBatcher 是唯一的 RunBatch 调用者：攒批 -> 推理 -> 路由结果。
 func (s *Scheduler) runBatcher() {
 	defer s.wgBatch.Done()
 	for {
@@ -226,41 +287,45 @@ func (s *Scheduler) runBatcher() {
 		if !ok {
 			return
 		}
-		first := pj
 		// 首项可能在排队期间已被取消。
-		if err := first.job.ctx.Err(); err != nil {
-			s.batch.Release(first.p)
-			first.resolve(nil, err)
+		if pj.canceled() {
+			s.batch.Release(pj.p)
+			s.finishPrepared(pj, nil, pj.job.ctx.Err())
 			continue
 		}
-		batch := []*preparedJob{first}
-		if s.maxBatch > 1 {
-			timer := time.NewTimer(s.maxWait)
-		collect:
-			for len(batch) < s.maxBatch {
-				select {
-				case pj, ok := <-s.prepared:
-					if !ok {
-						timer.Stop()
-						break collect
-					}
-					if pj.job.ctx.Err() != nil {
-						s.batch.Release(pj.p)
-						pj.resolve(nil, pj.job.ctx.Err())
-						continue
-					}
-					batch = append(batch, pj)
-				case <-timer.C:
-					break collect
-				case <-s.done:
-					timer.Stop()
-					break collect
-				}
-			}
-			timer.Stop()
-		}
+		batch := s.collectBatch(pj)
 		s.runAndDeliver(batch)
 	}
+}
+
+// collectBatch 从首个已就绪项开始，在 MaxWait 预算内继续凑批直到满批/超时/关闭。
+// maxBatch<=1 时立即返回，不等待（消除固定 batch 模型的额外延迟）。
+func (s *Scheduler) collectBatch(first *preparedJob) []*preparedJob {
+	batch := []*preparedJob{first}
+	if s.maxBatch <= 1 {
+		return batch
+	}
+	timer := time.NewTimer(s.maxWait)
+	defer timer.Stop()
+	for len(batch) < s.maxBatch {
+		select {
+		case pj, ok := <-s.prepared:
+			if !ok {
+				return batch
+			}
+			if pj.canceled() {
+				s.batch.Release(pj.p)
+				s.finishPrepared(pj, nil, pj.job.ctx.Err())
+				continue
+			}
+			batch = append(batch, pj)
+		case <-timer.C:
+			return batch
+		case <-s.done:
+			return batch
+		}
+	}
+	return batch
 }
 
 // runAndDeliver 执行一批推理并把结果路由到各请求；任何路径都释放全部 Prepared。
@@ -268,9 +333,9 @@ func (s *Scheduler) runAndDeliver(batch []*preparedJob) {
 	// 二次过滤：从入队到拼装之间可能有请求被取消。
 	live := batch[:0]
 	for _, pj := range batch {
-		if err := pj.job.ctx.Err(); err != nil {
+		if pj.canceled() {
 			s.batch.Release(pj.p)
-			pj.resolve(nil, err)
+			s.finishPrepared(pj, nil, pj.job.ctx.Err())
 			continue
 		}
 		live = append(live, pj)
@@ -280,41 +345,60 @@ func (s *Scheduler) runAndDeliver(batch []*preparedJob) {
 		return
 	}
 
-	defer func() {
-		for _, pj := range batch {
-			s.batch.Release(pj.p)
-		}
-		if r := recover(); r != nil {
-			err := fmt.Errorf("engine panic: %v", r)
+	var results []engine.Result
+	var err error
+	func() {
+		// Release 始终执行；panic 转成整批错误，batcher 不崩。
+		defer func() {
 			for _, pj := range batch {
-				pj.resolve(nil, err)
+				s.batch.Release(pj.p)
 			}
+			if r := recover(); r != nil {
+				s.panics.Add(1)
+				err = fmt.Errorf("engine panic: %v", r)
+			}
+		}()
+		s.batches.Add(1)
+		// 单个客户端断开不能中止共享批；ORT Run 本身也不可打断。
+		ctx := context.WithoutCancel(batch[0].job.ctx)
+		inputs := make([]*engine.Prepared, len(batch))
+		for i, pj := range batch {
+			inputs[i] = pj.p
 		}
+		results, err = s.batch.RunBatch(ctx, inputs)
 	}()
 
-	// 单个客户端断开不能中止共享批；ORT Run 本身也不可打断。
-	ctx := context.WithoutCancel(batch[0].job.ctx)
-	inputs := make([]*engine.Prepared, len(batch))
-	for i, pj := range batch {
-		inputs[i] = pj.p
-	}
-	results, err := s.batch.RunBatch(ctx, inputs)
 	if err != nil {
 		for _, pj := range batch {
-			pj.resolve(nil, err)
+			s.finishPrepared(pj, nil, err)
 		}
 		return
 	}
 	if len(results) != len(batch) {
 		err := fmt.Errorf("engine returned %d results for a batch of %d", len(results), len(batch))
 		for _, pj := range batch {
-			pj.resolve(nil, err)
+			s.finishPrepared(pj, nil, err)
 		}
 		return
 	}
 	for i, pj := range batch {
-		pj.resolve(results[i], nil)
+		s.finishPrepared(pj, results[i], nil)
 	}
+}
+
+// finishJob 交付单个 job 的结果并更新计数/inFlight。
+func (s *Scheduler) finishJob(j *job, res engine.Result, err error) {
+	j.resolve(res, err)
+	s.inFlight.Add(-1)
+	if err != nil {
+		s.failed.Add(1)
+	} else {
+		s.succeeded.Add(1)
+	}
+}
+
+func (s *Scheduler) finishPrepared(pj *preparedJob, res engine.Result, err error) {
+	s.finishJob(pj.job, res, err)
 }
 
 // Close 停止接收新请求并等待 worker/batcher 退出。可重复调用。
