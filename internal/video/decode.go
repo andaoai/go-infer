@@ -26,6 +26,8 @@ type Config struct {
 	FPS    int    // 输出抽帧率；0 表示不额外指定（用源帧率）
 	MaxW   int    // 长边等比缩放到此宽度以减推理负载；0 不缩放
 	Live   bool   // 实时流：启用低延迟参数；EOF/断线后由调用方决定是否重启
+	// Stderr 可选：接收 ffmpeg 日志（探针用于回传真实失败原因）；nil 时丢弃。
+	Stderr io.Writer
 }
 
 // Decoder 封装一个运行中的 ffmpeg 子进程及其 stdout MJPEG 流。
@@ -59,8 +61,12 @@ func New(ctx context.Context, cfg Config) (*Decoder, error) {
 	cmd := exec.CommandContext(ctx, ff, args...)
 	// 进程组/Pdeathsig：父进程（go-infer）退出时内核回收 ffmpeg，不留孤儿。
 	cmd.SysProcAttr = sysProcAttr()
-	// 不继承父进程的 stderr 以免在无控制台环境下写坏；ffmpeg 日志量级大，丢弃。
-	cmd.Stderr = io.Discard
+	// ffmpeg 日志量级大，默认丢弃；探针场景调用方可通过 Config.Stderr 收走错误原因。
+	if cfg.Stderr != nil {
+		cmd.Stderr = cfg.Stderr
+	} else {
+		cmd.Stderr = io.Discard
+	}
 	out, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("stdout pipe: %w", err)

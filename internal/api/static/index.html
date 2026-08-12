@@ -226,8 +226,16 @@
   .vsrc.active{border-color:var(--accent);background:rgba(47,129,247,.1)}
   .vsrc .n{font-size:13px;color:var(--text);display:flex;align-items:center;gap:7px}
   .vsrc .k{font-family:var(--mono);font-size:9px;text-transform:uppercase;border:1px solid var(--border);color:var(--muted);border-radius:10px;padding:0 6px}
+  .vsrc .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .vsrc .note{font-size:11px;color:var(--muted)}
   .vsrc .be{font-size:10px;color:var(--warn, #d29922)}
+  .vtest{font-size:11px;padding:2px 9px;border-radius:6px;border:1px solid var(--border);
+    background:transparent;color:var(--muted);cursor:pointer;flex:none}
+  .vtest:hover{border-color:var(--accent);color:var(--text)}
+  .vp{font-size:11px;font-family:var(--mono);margin-top:1px}
+  .vp.testing{color:var(--muted)}
+  .vp.ok{color:var(--green)}
+  .vp.fail{color:#ffb3ad;cursor:help}
   .vadd{margin-top:4px;display:flex;flex-direction:column;gap:7px}
   .vadd input{width:100%}
   .vplayer{background:#000;border:1px solid var(--border);border-radius:8px;min-height:360px;
@@ -374,6 +382,7 @@
         <label>最大宽 <input type="number" id="vMaxw" value="960" min="320" max="1920" step="80"></label>
         <button class="btn primary" id="vStart">开始</button>
         <button class="btn" id="vStop">停止</button>
+        <button class="btn" id="vProbeAll">全部测试</button>
         <span style="color:var(--muted);font-size:12px">纯播放，仅临时预览，不导出、不存盘</span>
       </div>
 
@@ -382,7 +391,10 @@
           <div class="vsources" id="vSources"><div class="empty">加载中…</div></div>
           <div class="vadd">
             <input type="text" id="vUrl" placeholder="自定义 RTSP/HLS/HTTP 地址…">
-            <button class="btn" id="vUseUrl">播放此地址</button>
+            <div style="display:flex;gap:7px">
+              <button class="btn" id="vUseUrl" style="flex:1">播放此地址</button>
+              <button class="btn" id="vTestUrl">测试</button>
+            </div>
             <label class="pick" id="pickVideo" style="margin:0">
               <div class="t">上传本地视频文件</div>
               <div class="n" id="vFileName">mp4/mov/mkv/avi/webm · 临时预览，看完即弃</div>
@@ -790,6 +802,7 @@ function renderValReport(rep){
 const VCAT = {demo:'演示流', tv:'电视直播', nature:'自然风光', traffic:'监控/交通'};
 const VCAT_ORDER = ['demo','tv','nature','traffic'];
 let vSources = [], vSelectedSrc = '', vRunning = false, vFrame = null;
+let vProbe = {}; // src -> {status:'testing'|'ok'|'fail', latency, w, h, reason}
 
 async function loadVideoSources(){
   try{
@@ -825,8 +838,9 @@ function renderVSources(){
     html += `<div class="vcat">${esc(label)}（${groups[c].length}）</div>`;
     html += groups[c].map(s=>`
       <div class="vsrc ${vSelectedSrc===s.id?'active':''}" data-id="${esc(s.id)}" title="双击播放">
-        <div class="n"><span class="k">${esc(s.kind)}</span>${esc(s.name)}${s.best_effort?'<span class="be">可能失效</span>':''}</div>
+        <div class="n"><span class="k">${esc(s.kind)}</span><span class="nm">${esc(s.name)}</span>${s.best_effort?'<span class="be">可能失效</span>':''}<button class="vtest" data-test="${esc(s.id)}" title="测试能否拉到画面">测试</button></div>
         ${s.note?`<div class="note">${esc(s.note)}</div>`:''}
+        ${probeLine(s.id)}
       </div>`).join('');
   });
   el.innerHTML = html;
@@ -840,6 +854,69 @@ function renderVSources(){
     };
     c.ondblclick=()=>{ c.onclick(); startVideo(); };
   });
+  el.querySelectorAll('.vtest').forEach(b=>{
+    b.onclick=(e)=>{ e.stopPropagation(); probeSource(b.dataset.test); };
+    b.ondblclick=(e)=>e.stopPropagation();
+  });
+}
+
+// probeLine 渲染某个源的探针状态徽标（未测时返回空串）。
+function probeLine(src){
+  const p = vProbe[src];
+  if(!p) return '';
+  if(p.status==='testing') return `<div class="vp testing">● 测试中…</div>`;
+  if(p.status==='ok'){
+    const dim = p.w ? ` · ${p.w}×${p.h}` : '';
+    return `<div class="vp ok">● 可用 · ${p.latency}ms${dim}</div>`;
+  }
+  const reason = esc(p.reason || '连接失败');
+  return `<div class="vp fail" title="${reason}">● 不可用 · ${esc(shortReason(p.reason))}</div>`;
+}
+
+// shortReason 把 ffmpeg 的冗长错误压成一行短提示（完整原因在 title 里）。
+function shortReason(r){
+  if(!r) return '连接失败';
+  // ffmpeg 错误常见形如 "rtsp://...: Connection refused"，取冒号后最后一段。
+  const m = r.split(':').pop().trim();
+  if(m && m.length<=60) return m;
+  return r.length>60 ? r.slice(0,60)+'…' : r;
+}
+
+// probeSource 对单个 src 发起探针，结果写入 vProbe 并重渲染。
+async function probeSource(src){
+  vProbe[src] = {status:'testing'};
+  renderVSources();
+  try{
+    const r = await fetch('/api/video/probe?src='+encodeURIComponent(src));
+    if(r.status===503){ vProbe[src]={status:'fail',reason:'视频源未开启（未找到 ffmpeg）'}; }
+    else if(!r.ok){ vProbe[src]={status:'fail',reason:'HTTP '+r.status}; }
+    else {
+      const d = await r.json();
+      vProbe[src] = d.ok
+        ? {status:'ok',latency:d.latency_ms,w:d.width,h:d.height}
+        : {status:'fail',reason:d.reason||'连接失败'};
+    }
+  }catch(err){
+    vProbe[src] = {status:'fail',reason:err.message};
+  }
+  renderVSources();
+}
+
+// probeAll 以 3 路并发对所有内置/自定义源逐个探针。
+let vProbingAll = false;
+async function probeAll(){
+  if(vProbingAll) return;
+  const ids = vSources.map(s=>s.id);
+  if(!ids.length) return;
+  vProbingAll = true;
+  const btn = $('#vProbeAll'); btn.disabled = true;
+  try{
+    let idx = 0;
+    const worker = async ()=>{ while(idx<ids.length){ const my=idx++; await probeSource(ids[my]); } };
+    await Promise.all([worker(),worker(),worker()]);
+  }finally{
+    vProbingAll = false; btn.disabled = false;
+  }
 }
 function setVStatus(txt, cls){
   const st = $('#vStatus');
@@ -883,6 +960,19 @@ function stopVideo(){
 $('#vStart').onclick = startVideo;
 $('#vStop').onclick = stopVideo;
 $('#vUseUrl').onclick = ()=>{ if($('#vUrl').value.trim()){ vSelectedSrc=''; renderVSources(); startVideo(); } };
+$('#vProbeAll').onclick = probeAll;
+$('#vTestUrl').onclick = async ()=>{
+  const url = $('#vUrl').value.trim();
+  if(!url){ setVStatus('请先填写自定义地址','err'); return; }
+  setVStatus('测试中…','');
+  try{
+    const r = await fetch('/api/video/probe?src='+encodeURIComponent('url:'+url));
+    if(!r.ok){ setVStatus('测试失败：HTTP '+r.status,'err'); return; }
+    const d = await r.json();
+    if(d.ok) setVStatus(`可用 · ${d.latency_ms}ms${d.width?` · ${d.width}×${d.height}`:''}`,'live');
+    else setVStatus('不可用：'+(d.reason||'连接失败'),'err');
+  }catch(err){ setVStatus('测试失败：'+err.message,'err'); }
+};
 $('#pickVideo').addEventListener('click',()=>$('#vFile').value='');
 $('#vFile').onchange = async ()=>{
   const f = $('#vFile').files[0];

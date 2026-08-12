@@ -60,6 +60,19 @@ type VideoService interface {
 	// Run 解析 src（内置 ID / upload:<id> / 原始 URL / v4l2:），用 ffmpeg 抽帧，
 	// 每帧以原始 JPEG 字节回调 cb。实时流断线时在 ctx 内退避重连；点播源到 EOF 返回 nil。
 	Run(ctx context.Context, src string, opts RunOpts, cb FrameFunc) error
+	// Probe 用与播放相同的 ffmpeg 参数只抓第一帧，快速判断 src 能否拉到画面。
+	// 连通性失败不返回 error，而是体现在 ProbeResult.OK=false（便于前端直接展示原因）；
+	// 仅当服务未开启或 src 非法时才返回 error。
+	Probe(ctx context.Context, src string) (ProbeResult, error)
+}
+
+// ProbeResult 是一次视频源探针的结果。
+type ProbeResult struct {
+	OK        bool   `json:"ok"`
+	LatencyMS int64  `json:"latency_ms"`        // 启动 ffmpeg 到拿到首帧的耗时（毫秒）
+	Width     int    `json:"width,omitempty"`   // 首帧宽（能解出时）
+	Height    int    `json:"height,omitempty"`  // 首帧高（能解出时）
+	Reason    string `json:"reason,omitempty"`  // OK=false 时的失败原因（取自 ffmpeg stderr）
 }
 
 // SetVideo 挂载视频服务；传 nil 关闭视频 tab。
@@ -166,4 +179,27 @@ func (s *Server) handleVideoStream(w http.ResponseWriter, r *http.Request) {
 			log.Printf("视频流 %s 结束: %v", src, err)
 		}
 	}
+}
+
+func (s *Server) handleVideoProbe(w http.ResponseWriter, r *http.Request) {
+	if s.video == nil || !s.video.Enabled() {
+		http.Error(w, ErrVideoDisabled.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	src := r.URL.Query().Get("src")
+	if src == "" {
+		http.Error(w, "缺少 src", http.StatusBadRequest)
+		return
+	}
+	res, err := s.video.Probe(r.Context(), src)
+	if err != nil {
+		// 非法 src（未知内置 ID / 过期上传引用）→ 400；其余异常 → 500。
+		if errors.Is(err, ErrVideoBadSrc) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }

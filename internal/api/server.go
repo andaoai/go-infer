@@ -119,6 +119,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/video/sources", s.handleVideoSources)
 	s.mux.HandleFunc("/api/video/upload", s.handleVideoUpload)
 	s.mux.HandleFunc("/api/video/stream", s.handleVideoStream)
+	s.mux.HandleFunc("/api/video/probe", s.handleVideoProbe)
 	s.mux.Handle("/", staticHandler())
 }
 

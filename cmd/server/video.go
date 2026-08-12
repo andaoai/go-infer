@@ -7,9 +7,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"image/jpeg"
 	"io"
 	"mime/multipart"
 	"os"
@@ -30,9 +32,10 @@ type videoService struct {
 	maxSessions    int
 	uploadTTL      time.Duration
 
-	sem     chan struct{}
-	mu      sync.Mutex
-	uploads map[string]string // id -> 临时文件绝对路径
+	sem      chan struct{}
+	probeSem chan struct{} // 探针独立限流，不占播放会话槽
+	mu       sync.Mutex
+	uploads  map[string]string // id -> 临时文件绝对路径
 }
 
 func newVideoService(ffmpegPath, scratch string, maxUploadBytes int64, maxSessions int, extra []video.Source) (*videoService, error) {
@@ -59,6 +62,7 @@ func newVideoService(ffmpegPath, scratch string, maxUploadBytes int64, maxSessio
 		maxSessions:    maxSessions,
 		uploadTTL:      2 * time.Hour,
 		sem:            make(chan struct{}, maxSessions),
+		probeSem:       make(chan struct{}, 4),
 		uploads:        map[string]string{},
 	}
 	go svc.gcUploads()
@@ -113,10 +117,86 @@ func (v *videoService) Acquire() (func(), error) {
 	}
 }
 
+// probeTimeout 是单次探针的上限：连不上或拿不到首帧即判失败。
+const probeTimeout = 10 * time.Second
+
+// Probe 用与播放一致的 ffmpeg 参数只抓第一帧，判断 src 能否拉到画面。
+// 探针有独立的并发上限（4），不占播放会话槽；失败原因尽量取自 ffmpeg stderr。
+func (v *videoService) Probe(ctx context.Context, src string) (api.ProbeResult, error) {
+	if !v.Enabled() {
+		return api.ProbeResult{}, api.ErrVideoDisabled
+	}
+	input, live, err := v.resolveSource(src)
+	if err != nil {
+		return api.ProbeResult{}, err
+	}
+
+	// 独立限流：测连通性不应被正在观看的会话挡住，也不应被「全部测试」打爆。
+	select {
+	case v.probeSem <- struct{}{}:
+		defer func() { <-v.probeSem }()
+	case <-ctx.Done():
+		return api.ProbeResult{}, ctx.Err()
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+
+	start := time.Now()
+	var stderr bytes.Buffer
+	// 用与播放相同的 low-delay 参数（经 live 传入），只把 fps/长边压小一点省带宽；
+	// 这样「探针通过」≈「真的能播」。
+	dec, err := video.New(ctx, video.Config{
+		FFmpeg: v.ffmpeg, Input: input, FPS: 2, MaxW: 640, Live: live, Stderr: &stderr,
+	})
+	latency := time.Since(start).Milliseconds()
+	if err != nil {
+		return api.ProbeResult{OK: false, LatencyMS: latency, Reason: probeReason(err, &stderr)}, nil
+	}
+	defer dec.Close()
+
+	frame, err := dec.NextJPEG()
+	latency = time.Since(start).Milliseconds()
+	if err != nil {
+		return api.ProbeResult{OK: false, LatencyMS: latency, Reason: probeReason(err, &stderr)}, nil
+	}
+	res := api.ProbeResult{OK: true, LatencyMS: latency}
+	// 顺手解一下首帧分辨率（只解头不解像素，很便宜），给前端展示用。
+	if cfg, e := jpeg.DecodeConfig(bytes.NewReader(frame)); e == nil {
+		res.Width, res.Height = cfg.Width, cfg.Height
+	}
+	return res, nil
+}
+
+// probeReason 从 ffmpeg stderr 取最后一行非空内容作为失败原因；没有就用 err。
+// ffmpeg 以 -loglevel error 运行，最后一行通常就是 Connection refused / timed out 之类。
+func probeReason(err error, stderr *bytes.Buffer) string {
+	if stderr != nil {
+		lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+		for i := len(lines) - 1; i >= 0; i-- {
+			if l := strings.TrimSpace(lines[i]); l != "" {
+				return truncateRune(l, 200)
+			}
+		}
+	}
+	return truncateRune(err.Error(), 200)
+}
+
+// truncateRune 按 rune 截断字符串到至多 n 个字符，避免切断 UTF-8。
+func truncateRune(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
+}
+
 // Run 驱动一次播放会话。每帧解码出原始 JPEG → cb。
 // 调用方需先 Acquire 成功（这样 503 能在写响应头之前返回）。
-func (v *videoService) Run(ctx context.Context, src string, opts api.RunOpts, cb api.FrameFunc) error {
-	if !v.Enabled() {
+func (v *videoService) Run(ctx context.Context, src string, opts api.RunOpts, cb api.FrameFunc) error {	if !v.Enabled() {
 		return api.ErrVideoDisabled
 	}
 	input, live, err := v.resolveSource(src)
