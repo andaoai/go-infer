@@ -29,6 +29,60 @@ func TestParseDetShape(t *testing.T) {
 	}
 }
 
+func TestParseShapesDynamicBatch(t *testing.T) {
+	// 动态 batch 维：[-1,116,8400] 与 [-1,8400,116]
+	if a, attr, nm, tr, err := parseDetShape(ort.NewShape(-1, 116, 8400), 80); err != nil || a != 8400 || attr != 116 || nm != 32 || tr {
+		t.Fatalf("dynamic official: got %d/%d/%d/%v %v", a, attr, nm, tr, err)
+	}
+	if a, attr, nm, tr, err := parseDetShape(ort.NewShape(-1, 8400, 116), 80); err != nil || a != 8400 || attr != 116 || nm != 32 || !tr {
+		t.Fatalf("dynamic transposed: got %d/%d/%d/%v %v", a, attr, nm, tr, err)
+	}
+	// 固定 N>1 + 动态 proto
+	if a, attr, _, _, err := parseDetShape(ort.NewShape(4, 116, 8400), 80); err != nil || a != 8400 || attr != 116 {
+		t.Fatalf("fixed N=4: got %d/%d %v", a, attr, err)
+	}
+	if mh, mw, err := parseProtoShape(ort.NewShape(-1, 32, 160, 160), 32); err != nil || mh != 160 || mw != 160 {
+		t.Fatalf("dynamic proto: got %dx%d %v", mh, mw, err)
+	}
+	// 非 batch 维动态应报错
+	if _, _, _, _, err := parseDetShape(ort.NewShape(1, -1, 8400), 80); err == nil {
+		t.Fatal("expected error for dynamic non-batch det dim")
+	}
+}
+
+func TestDecodeDetectionsSlotIsolation(t *testing.T) {
+	// 官方排布 [B,attrs,anchors]，nc=1,nm=2 → attrs=7，anchors=2，两槽。
+	// 仅 slot1/anchor1 放一个高分项，slot0 必须为空。
+	e := &Engine{
+		attrs: 7, anchors: 2, nc: 1, nm: 2, transposed: false,
+		detStride: 7 * 2,
+		detBuf:    make([]float32, 2*7*2),
+		cfg:       Config{ConfThresh: 0.25},
+	}
+	base := 1*e.detStride + 1
+	e.detBuf[base] = 10              // cx
+	e.detBuf[base+e.anchors] = 20    // cy
+	e.detBuf[base+2*e.anchors] = 4   // w
+	e.detBuf[base+3*e.anchors] = 6   // h
+	e.detBuf[base+4*e.anchors] = 0.9 // class0
+	e.detBuf[base+5*e.anchors] = 0.1 // coeff0
+	e.detBuf[base+6*e.anchors] = 0.2 // coeff1
+
+	if c := e.decodeDetections(0, 0.25); len(c) != 0 {
+		t.Fatalf("slot 0 should be empty, got %d", len(c))
+	}
+	c := e.decodeDetections(1, 0.25)
+	if len(c) != 1 {
+		t.Fatalf("slot 1 want 1 cand, got %d", len(c))
+	}
+	if c[0].box.ClassID != 0 || c[0].box.Confidence < 0.89 || c[0].box.X1 != 8 || c[0].box.Y1 != 17 {
+		t.Fatalf("unexpected box: %+v", c[0].box)
+	}
+	if len(c[0].coeffs) != 2 || c[0].coeffs[0] != 0.1 || c[0].coeffs[1] != 0.2 {
+		t.Fatalf("coeffs not copied out: %v", c[0].coeffs)
+	}
+}
+
 func TestParseProtoShape(t *testing.T) {
 	mh, mw, err := parseProtoShape(ort.NewShape(1, 32, 160, 160), 32)
 	if err != nil {

@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -200,6 +201,11 @@ func (s *Server) handlePredict(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	res, err := eng.Run(r.Context(), req)
 	if err != nil {
+		// 调度层背压/关闭：队列满或引擎关闭时返回 503，客户端可重试。
+		if errors.Is(err, engine.ErrBusy) || errors.Is(err, engine.ErrClosed) {
+			http.Error(w, "engine busy", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, "inference: "+err.Error(), http.StatusInternalServerError)
 		return
 	}

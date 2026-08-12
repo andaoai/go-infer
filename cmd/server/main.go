@@ -10,8 +10,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/andaoai/go-infer/internal/api"
 	"github.com/andaoai/go-infer/internal/appcfg"
@@ -22,6 +24,7 @@ import (
 	"github.com/andaoai/go-infer/internal/format"
 	"github.com/andaoai/go-infer/internal/format/yolo"
 	"github.com/andaoai/go-infer/internal/ortenv"
+	"github.com/andaoai/go-infer/internal/sched"
 	"github.com/andaoai/go-infer/internal/storage"
 	"github.com/andaoai/go-infer/internal/storage/local"
 	ort "github.com/yalue/onnxruntime_go"
@@ -44,6 +47,11 @@ func main() {
 		addr        = flag.String("addr", ":8080", "监听地址")
 		ortLib      = flag.String("ort-lib", "", "libonnxruntime.so 路径；留空则自动查找")
 
+		schedWorkers  = flag.Int("sched-workers", 0, "并发预处理/推理 worker 数；0 取 CPU 核数")
+		schedQueue    = flag.Int("sched-queue", 64, "请求队列上限；满了立即返回 503")
+		schedMaxBatch = flag.Int("sched-max-batch", 0, "dynamic batching 上限；0 用模型自身上限（固定 batch=1 模型忽略）")
+		schedMaxWait  = flag.String("sched-max-wait", "5ms", "凑满一批最多等待时长（如 5ms/0）；batch=1 时忽略")
+
 		captureDir    = flag.String("capture-dir", "", "推理采集池根目录（本地目录，如 dataset）；留空则不采集")
 		capturePool   = flag.String("capture-pool", "", "采集池在 -capture-dir 下的前缀（默认空，直接落在 <dir>/<engine>/<date>）")
 		captureRate   = flag.Float64("capture-rate", 0.1, "普通样本采样概率 0~1；无检测/低置信度样本必存")
@@ -64,6 +72,27 @@ func main() {
 	flag.Var(validateTests, "validate-testset", "网页可选默认测试集，格式 name=path:split；可重复指定")
 	flag.Var(videoSources, "video-source", "网页视频源，格式 name=url；可重复指定（同内置名则覆盖）")
 	flag.Parse()
+
+	workers := *schedWorkers
+	if workers <= 0 {
+		workers = runtime.NumCPU()
+	}
+	var maxWait time.Duration
+	if strings.TrimSpace(*schedMaxWait) != "" && *schedMaxWait != "0" {
+		d, err := time.ParseDuration(*schedMaxWait)
+		if err != nil {
+			log.Fatalf("解析 -sched-max-wait: %v", err)
+		}
+		maxWait = d
+	}
+	schedCfg := sched.Config{
+		Workers:    workers,
+		QueueDepth: *schedQueue,
+		MaxBatch:   *schedMaxBatch,
+		MaxWait:    maxWait,
+	}
+	log.Printf("调度器: workers=%d queue=%d max-batch=%d max-wait=%s",
+		workers, *schedQueue, *schedMaxBatch, maxWait)
 
 	if lib := ortenv.FindLib(*ortLib); lib != "" {
 		log.Printf("使用 ONNX Runtime: %s", lib)
@@ -86,22 +115,27 @@ func main() {
 		Classes:    classList,
 		ConfThresh: float32(*conf),
 		IoUThresh:  float32(*iou),
+		MaxBatch:   *schedMaxBatch,
 	})
 	if err != nil {
 		log.Fatalf("创建引擎 %s: %v", *name, err)
 	}
-	defer eng.Close()
+	defer eng.Close() // LIFO：调度器先停 goroutine，再销毁底层 ORT session
+	detSched := sched.New(eng, schedCfg)
+	defer detSched.Close()
 
 	srv := api.NewServer()
-	srv.Register(eng)
+	srv.Register(detSched)
 
 	// 分割引擎：模型文件存在才注册，缺失不影响检测服务。
 	if !*noSeg {
-		if segEng, err := maybeLoadSeg(*segModel, *segName, *imgsz, classList, *conf, *iou, *maskThr); err != nil {
+		if segEng, err := maybeLoadSeg(*segModel, *segName, *imgsz, classList, *conf, *iou, *maskThr, *schedMaxBatch); err != nil {
 			log.Printf("警告: 分割引擎加载失败，已跳过: %v", err)
 		} else if segEng != nil {
-			srv.Register(segEng)
 			defer segEng.Close()
+			segSched := sched.New(segEng, schedCfg)
+			defer segSched.Close()
+			srv.Register(segSched)
 			log.Printf("已注册分割引擎: %s (%s)", segEng.Name(), *segModel)
 		}
 	}
@@ -168,7 +202,7 @@ func main() {
 }
 
 // maybeLoadSeg 在模型文件存在时创建分割引擎；文件不存在返回 (nil, nil)。
-func maybeLoadSeg(modelPath, name string, imgsz int, classes []string, conf, iou, maskThr float64) (engine.Engine, error) {
+func maybeLoadSeg(modelPath, name string, imgsz int, classes []string, conf, iou, maskThr float64, maxBatch int) (engine.Engine, error) {
 	if _, err := os.Stat(modelPath); err != nil {
 		if os.IsNotExist(err) {
 			log.Printf("未找到分割模型 %s，跳过分割引擎（用 -seg-model 指定或 -no-seg 关闭此提示）", modelPath)
@@ -185,6 +219,7 @@ func maybeLoadSeg(modelPath, name string, imgsz int, classes []string, conf, iou
 		ConfThresh: float32(conf),
 		IoUThresh:  float32(iou),
 		MaskThresh: float32(maskThr),
+		MaxBatch:   maxBatch,
 	})
 }
 

@@ -8,8 +8,17 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"image"
 	"time"
+)
+
+// 调度层使用的哨兵错误。引擎实现不应主动返回它们；由 sched 在队列满/已关闭时产生。
+var (
+	// ErrBusy 表示有界请求队列已满，调用方应稍后重试（HTTP 映射为 503）。
+	ErrBusy = errors.New("engine busy, queue full")
+	// ErrClosed 表示调度器已关闭，不再接受新请求（HTTP 映射为 503）。
+	ErrClosed = errors.New("engine closed")
 )
 
 // Task 标识引擎处理的任务类型。
@@ -94,6 +103,34 @@ type Engine interface {
 	Run(ctx context.Context, req *Request) (Result, error)
 	// Close 释放模型与设备资源。
 	Close() error
+}
+
+// Prepared 是一张图的预处理产物：已归一化的 NCHW 缓冲（借自引擎 sync.Pool）
+// 与引擎私有的元信息（letterbox 缩放/填充、原图边界、conf 等）。
+//
+// 缓冲所有权在 BatchEngine 与调度器之间流转：Prepare 借出，RunBatch 消费后
+// 由调度器调用 Release 归还。Meta 只应持有标量/值类型，不得引用 Input 缓冲。
+type Prepared struct {
+	Input []float32 // 一张图，3*H*W，NCHW RGB/255
+	Meta  any       // 引擎私有
+}
+
+// BatchEngine 是 Engine 的可选能力：支持"预处理 / 合批推理 / 释放"三段式，
+// 供 sched 做流水线并行与 dynamic batching。未实现该接口的引擎由调度器
+// 退化为 N worker 直接调用 Run（仍有队列与背压）。
+type BatchEngine interface {
+	Engine
+	// MaxBatch 返回一次 RunBatch 能接受的最大图片数。
+	// 由模型输入 batch 维决定：固定 1 → 1；动态维 → 引擎配置上限。
+	MaxBatch() int
+	// Prepare 在设备锁之外完成一张图的 CPU 预处理，返回借出的 Prepared。
+	// 返回错误时不得泄漏借出的缓冲。
+	Prepare(ctx context.Context, req *Request) (*Prepared, error)
+	// RunBatch 在一次底层推理中处理 n 张已预处理的图，返回等长结果切片。
+	// 整批成功或整批失败（底层 session.Run 是 all-or-nothing）；n∈[1,MaxBatch]。
+	RunBatch(ctx context.Context, batch []*Prepared) ([]Result, error)
+	// Release 归还 Prepared 借用的缓冲。对 nil 安全、可重复调用。
+	Release(p *Prepared)
 }
 
 // Box 是内部使用的轴对齐框（预处理/后处理阶段，坐标为模型空间）。
