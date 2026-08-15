@@ -6,7 +6,8 @@
 //   - 检测模型：box mAP@.5 / mAP@.50:.95
 //   - 分割模型：box mAP@.5 / mAP@.50:.95、mask mAP@.5 / mAP@.50:.95
 //
-// 模型文件缺失时自动跳过对应引擎，不报错。
+// 校验引擎用 sched 包装，拿到 dynamic batching + 预处理/设备重叠；validate
+// 层以并发度 min(NumCPU,4) 发起推理。模型文件缺失时自动跳过对应引擎，不报错。
 package main
 
 import (
@@ -16,12 +17,14 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/andaoai/go-infer/internal/appcfg"
 	"github.com/andaoai/go-infer/internal/engines/onnxruntime/detect"
 	"github.com/andaoai/go-infer/internal/engines/onnxruntime/seg"
 	"github.com/andaoai/go-infer/internal/format/yolo"
 	"github.com/andaoai/go-infer/internal/ortenv"
+	"github.com/andaoai/go-infer/internal/sched"
 	"github.com/andaoai/go-infer/internal/storage/local"
 	"github.com/andaoai/go-infer/internal/validate"
 	ort "github.com/yalue/onnxruntime_go"
@@ -41,6 +44,7 @@ func main() {
 		iou      = flag.Float64("iou", 0.7, "NMS IoU 阈值（评测建议高于推理默认，默认 0.7）")
 		maskThr  = flag.Float64("mask-thr", 0.5, "分割掩膜二值化阈值")
 		limit    = flag.Int("limit", 0, "只校验前 N 张图（0=全量）")
+		workers  = flag.Int("c", 0, "校验并发 / sched worker 数；0 取 min(CPU 核数,4)")
 		ortLib   = flag.String("ort-lib", "", "libonnxruntime.so 路径；留空自动查找")
 	)
 	flag.Parse()
@@ -63,16 +67,25 @@ func main() {
 		log.Fatalf("打开存储 %s: %v", storeRoot, err)
 	}
 
-	opts := validate.Options{
-		Store:   st,
-		Codec:   yolo.New(),
-		Root:    dsPrefix,
-		Split:   *split,
-		Limit:   *limit,
-		Classes: classList,
+	c := *workers
+	if c <= 0 {
+		c = runtime.NumCPU()
+		if c > 4 {
+			c = 4
+		}
 	}
 
-	// 检测模型（文件缺失则跳过）。
+	opts := validate.Options{
+		Store:       st,
+		Codec:       yolo.New(),
+		Root:        dsPrefix,
+		Split:       *split,
+		Limit:       *limit,
+		Classes:     classList,
+		Concurrency: c,
+	}
+
+	// 检测模型（文件缺失则跳过）：用 sched 包装以获得 dynamic batching。
 	if _, err := os.Stat(*detModel); err == nil {
 		eng, err := detect.New(detect.Config{
 			Name: "det-val", ModelPath: *detModel, InputW: *imgsz, InputH: *imgsz,
@@ -82,8 +95,10 @@ func main() {
 			log.Fatalf("加载检测模型: %v", err)
 		}
 		defer eng.Close()
+		sc := sched.New(eng, sched.Config{Workers: c, MaxBatch: 0})
+		defer sc.Close()
 		opts.Jobs = append(opts.Jobs, validate.Job{
-			Name: "检测模型", Engine: eng, Metrics: []validate.MetricSpec{{Label: "box"}},
+			Name: "检测模型", Engine: sc, Metrics: []validate.MetricSpec{{Label: "box"}},
 		})
 	} else {
 		fmt.Printf("== 跳过检测模型（%s 不存在）==\n\n", *detModel)
@@ -100,8 +115,10 @@ func main() {
 			log.Fatalf("加载分割模型: %v", err)
 		}
 		defer eng.Close()
+		sc := sched.New(eng, sched.Config{Workers: c, MaxBatch: 0})
+		defer sc.Close()
 		opts.Jobs = append(opts.Jobs, validate.Job{
-			Name: "分割模型", Engine: eng,
+			Name: "分割模型", Engine: sc,
 			Metrics: []validate.MetricSpec{{Label: "box"}, {Label: "mask", UseMask: true}},
 		})
 	} else {

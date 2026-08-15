@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -21,6 +20,7 @@ import (
 	"github.com/andaoai/go-infer/internal/data"
 	"github.com/andaoai/go-infer/internal/engine"
 	"github.com/andaoai/go-infer/internal/format"
+	"github.com/andaoai/go-infer/internal/fsx"
 	"github.com/andaoai/go-infer/internal/storage"
 )
 
@@ -62,8 +62,9 @@ type Recorder struct {
 	wg   sync.WaitGroup
 	stop chan struct{}
 
-	mu   sync.Mutex
-	size int64 // 当前采集池总字节（启动时扫描，运行期增量维护）
+	mu               sync.Mutex
+	size             int64  // 当前采集池总字节（启动时扫描，运行期增量维护）
+	writesSinceEvict uint64 // 距上次淘汰以来的成功写入次数（节流全量 List+排序）
 }
 
 // New 创建采集器并启动后台 worker。Store/Codec 为空返回 nil（表示不采集）。
@@ -223,7 +224,7 @@ func (r *Recorder) write(s Sample) {
 	if !r.cfg.Codec.IsImageKey("x" + ext) {
 		ext = ".jpg"
 	}
-	imgKey := keyJoin(r.cfg.PoolRoot, sanitize(s.Engine), day, "images", stem+ext)
+	imgKey := fsx.Join(r.cfg.PoolRoot, sanitize(s.Engine), day, "images", stem+ext)
 	lblKey := r.cfg.Codec.LabelKey(imgKey)
 
 	// 先写标签，再写图片；图片失败则回滚标签，避免孤儿标签。
@@ -249,6 +250,9 @@ func (r *Recorder) enforceQuota() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.size <= r.cfg.QuotaBytes {
+		return
+	}
+	if r.writesSinceEvict < 64 {
 		return
 	}
 	ctx := context.Background()
@@ -288,6 +292,7 @@ func (r *Recorder) enforceQuota() {
 			}
 		}
 	}
+	r.writesSinceEvict = 0
 }
 
 // scanSize 统计存储中采集池现有总字节。
@@ -308,6 +313,7 @@ func scanSize(ctx context.Context, st storage.Storage, root string) (int64, erro
 func (r *Recorder) addSize(n int64) {
 	r.mu.Lock()
 	r.size += n
+	r.writesSinceEvict++
 	r.mu.Unlock()
 }
 
@@ -324,17 +330,6 @@ func (r *Recorder) randHex(n int) string {
 		}
 	}
 	return string(b)
-}
-
-// keyJoin 用正斜杠拼接存储 key（存储无关的逻辑路径）。
-func keyJoin(parts ...string) string {
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if p != "" {
-			out = append(out, filepath.ToSlash(p))
-		}
-	}
-	return strings.Join(out, "/")
 }
 
 // sanitize 把引擎名里的路径分隔符/特殊字符替换掉，避免越出采集根目录。

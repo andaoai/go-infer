@@ -1,6 +1,7 @@
 package postprocess
 
 import (
+	"math/rand"
 	"testing"
 
 	"github.com/andaoai/go-infer/internal/engine"
@@ -39,5 +40,42 @@ func TestNMSNoMutation(t *testing.T) {
 	_ = NMS(boxes, 0.5)
 	if boxes[0].Confidence != 0.5 || boxes[1].Confidence != 0.9 {
 		t.Fatalf("NMS mutated input order: %+v", boxes)
+	}
+}
+
+// TestNMSIndexedMatchesNMS 用确定性随机框验证 NMSIndexed 与 NMS 在 engine.Box 上
+// 产生完全相同的保留集合（按下标映射回原框）。
+func TestNMSIndexedMatchesNMS(t *testing.T) {
+	rng := rand.New(rand.NewSource(123))
+	for iter := 0; iter < 200; iter++ {
+		n := 1 + rng.Intn(20)
+		boxes := make([]engine.Box, n)
+		for i := range boxes {
+			x := float32(rng.Float64()) * 100
+			y := float32(rng.Float64()) * 100
+			w := float32(rng.Float64())*40 + 5
+			h := float32(rng.Float64())*40 + 5
+			boxes[i] = engine.Box{
+				ClassID:    rng.Intn(3),
+				Confidence: float32(rng.Float64()),
+				X1:         x, Y1: y, X2: x + w, Y2: y + h,
+			}
+		}
+		thresh := float32(0.3 + rng.Float64()*0.4)
+		kept := NMS(boxes, thresh)
+		idx := NMSIndexed(n,
+			func(i int) float32 { return boxes[i].Confidence },
+			func(i, j int) bool { return boxes[i].ClassID == boxes[j].ClassID },
+			func(i, j int) float32 { return IoU(boxes[i], boxes[j]) },
+			thresh,
+		)
+		if len(idx) != len(kept) {
+			t.Fatalf("iter %d: kept %d boxes, indexed kept %d indices", iter, len(kept), len(idx))
+		}
+		for k, bi := range idx {
+			if boxes[bi] != kept[k] {
+				t.Fatalf("iter %d pos %d mismatch: indexed=%+v nms=%+v", iter, k, boxes[bi], kept[k])
+			}
+		}
 	}
 }

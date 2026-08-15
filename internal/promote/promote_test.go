@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/andaoai/go-infer/internal/format/yolo"
+	"github.com/andaoai/go-infer/internal/fsx"
 	"github.com/andaoai/go-infer/internal/storage"
 	"github.com/andaoai/go-infer/internal/storage/local"
 )
@@ -16,12 +17,12 @@ import (
 func seedPool(t *testing.T, st *local.Storage, pool, eng, date, stem string, withLabel bool) {
 	t.Helper()
 	ctx := context.Background()
-	imgKey := keyJoin(pool, eng, date, "images", stem+".jpg")
+	imgKey := fsx.Join(pool, eng, date, "images", stem+".jpg")
 	if err := st.Put(ctx, imgKey, bytes.NewReader([]byte("img"))); err != nil {
 		t.Fatal(err)
 	}
 	if withLabel {
-		lblKey := keyJoin(pool, eng, date, "labels", stem+".txt")
+		lblKey := fsx.Join(pool, eng, date, "labels", stem+".txt")
 		if err := st.Put(ctx, lblKey, strings.NewReader("0 0.5 0.5 0.2 0.2\n")); err != nil {
 			t.Fatal(err)
 		}

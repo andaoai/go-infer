@@ -115,14 +115,31 @@ func TestWriteLayoutAndFiles(t *testing.T) {
 
 func TestQuotaEviction(t *testing.T) {
 	r, root := newTestRecorder(t, Config{Rate: 1, QuotaBytes: 90})
-	for i := 0; i < 6; i++ {
+	// 淘汰被节流：超配额后需累计 >=64 次成功写入才触发全量 List+排序。
+	for i := 0; i < 64; i++ {
 		r.Record(detSample(0.9))
 	}
 	r.Close()
 
 	imgs, _ := filepath.Glob(filepath.Join(root, "yolov8n", "20260810", "images", "*.jpg"))
-	if len(imgs) > 2 {
-		t.Errorf("配额未生效，剩余图片 %d 张（应 <=2）", len(imgs))
+	if len(imgs) > 12 {
+		t.Errorf("配额淘汰未生效，剩余图片 %d 张（应 <= 12）", len(imgs))
+	}
+	if len(imgs) >= 64 {
+		t.Errorf("一张都没删，剩余 %d 张", len(imgs))
+	}
+}
+
+// TestQuotaEvictionThrottle 验证节流本身：不足 64 次写入时即使超配额也不做全量扫描。
+func TestQuotaEvictionThrottle(t *testing.T) {
+	r, root := newTestRecorder(t, Config{Rate: 1, QuotaBytes: 90})
+	for i := 0; i < 10; i++ {
+		r.Record(detSample(0.9))
+	}
+	r.Close()
+	imgs, _ := filepath.Glob(filepath.Join(root, "yolov8n", "20260810", "images", "*.jpg"))
+	if len(imgs) != 10 {
+		t.Errorf("未达 64 次写入不应淘汰，剩余 %d 张（应 10）", len(imgs))
 	}
 }
 

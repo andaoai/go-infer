@@ -12,10 +12,12 @@ package detect
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/andaoai/go-infer/internal/engine"
 	"github.com/andaoai/go-infer/internal/engines/onnxruntime/ortbatch"
+	"github.com/andaoai/go-infer/internal/engines/onnxruntime/yolohead"
 	"github.com/andaoai/go-infer/internal/postprocess"
 	"github.com/andaoai/go-infer/internal/preprocess"
 	ort "github.com/yalue/onnxruntime_go"
@@ -35,14 +37,21 @@ type Config struct {
 	MaxBatch int
 }
 
+// detectView 是一次 RunBatch 的输出视图：持有从池中借出的整批输出缓冲，
+// 供各槽 postSlot 在设备锁之外同步读取。
+type detectView struct {
+	buf    []float32 // len = n*outStride，底层来自 outPool
+	stride int       // 每图输出元素数 anchors*attrs
+}
+
 // Engine 是 engine.Engine / engine.BatchEngine 的 ONNX Runtime YOLO 实现。
 // 输入缓冲、session、pool 与设备锁由内嵌的 *ortbatch.Runtime 管理；本结构只保留
-// 输出形状与输出缓冲。
+// 输出形状与输出缓冲池。
 type Engine struct {
 	*ortbatch.Runtime
 	cfg Config
 
-	outputBuf     []float32 // maxBatch*outStride
+	outPool       sync.Pool // 借出 []float32，len=MaxBatch()*outStride
 	outStride     int       // anchors*attrs，每图输出元素数
 	outAnchors    int
 	outAttrs      int // 4 + nc
@@ -93,15 +102,16 @@ func New(cfg Config) (*Engine, error) {
 	}
 
 	outStride := anchors * attrs
-	return &Engine{
+	e := &Engine{
 		Runtime:       rt,
 		cfg:           cfg,
-		outputBuf:     make([]float32, rt.MaxBatch()*outStride),
 		outStride:     outStride,
 		outAnchors:    anchors,
 		outAttrs:      attrs,
 		outTransposed: transposed,
-	}, nil
+	}
+	e.outPool.New = func() any { return make([]float32, rt.MaxBatch()*outStride) }
+	return e, nil
 }
 
 func (e *Engine) Name() string      { return e.cfg.Name }
@@ -118,76 +128,66 @@ func (e *Engine) RunBatch(ctx context.Context, batch []*engine.Prepared) ([]engi
 	return e.Runtime.RunBatch(ctx, batch, e.buildOutput, e.postSlot)
 }
 
-// buildOutput 在引擎自有 outputBuf 上按本次 batch n 构造输出张量。
-func (e *Engine) buildOutput(n int) (ortbatch.Output, error) {
+// buildOutput 从池中借出输出缓冲并按本次 batch n 构造输出张量。张量别名 buf；
+// Done 在所有 postSlot 返回后由 Runtime 调用，销毁张量并把整块缓冲归还池。
+func (e *Engine) buildOutput(n int) (ortbatch.Output, any, error) {
+	full := e.outPool.Get().([]float32) // len = MaxBatch*outStride
+	buf := full[:n*e.outStride]
 	var shape ort.Shape
 	if e.outTransposed {
 		shape = ort.NewShape(int64(n), int64(e.outAnchors), int64(e.outAttrs))
 	} else {
 		shape = ort.NewShape(int64(n), int64(e.outAttrs), int64(e.outAnchors))
 	}
-	out, err := ort.NewTensor(shape, e.outputBuf[:n*e.outStride])
+	out, err := ort.NewTensor(shape, buf)
 	if err != nil {
-		return ortbatch.Output{}, fmt.Errorf("create output tensor: %w", err)
+		e.outPool.Put(full)
+		return ortbatch.Output{}, nil, fmt.Errorf("create output tensor: %w", err)
 	}
 	return ortbatch.Output{
 		Values: []ort.Value{out},
-		Done:   func() { out.Destroy() },
-	}, nil
+		Done: func() {
+			out.Destroy()
+			e.outPool.Put(full)
+		},
+	}, &detectView{buf: buf, stride: e.outStride}, nil
 }
 
 // postSlot 对第 slot 个输出做解码、NMS 与坐标映射。
-func (e *Engine) postSlot(slot int, p *engine.Prepared, elapsed time.Duration) (engine.Result, error) {
+func (e *Engine) postSlot(slot int, p *engine.Prepared, view any, elapsed time.Duration) (engine.Result, error) {
 	m := p.Meta.(*ortbatch.Meta)
-	boxes := e.postprocess(slot, m.Conf)
+	v := view.(*detectView)
+	boxes := e.postprocess(v, slot, m.Conf)
 	detections := e.mapToImage(boxes, m)
 	return &engine.DetectionResult{Elapsed: elapsed, Detections: detections}, nil
 }
 
-// postprocess 解析第 slot 个输出，按类取最大分数并 NMS（按图独立，不跨图抑制）。
-func (e *Engine) postprocess(slot int, conf float32) []engine.Box {
-	attrs, anchors, nc := e.outAttrs, e.outAnchors, e.outAttrs-4
-	base0 := slot * e.outStride
-	cands := make([]engine.Box, 0, 256)
-	for a := 0; a < anchors; a++ {
-		var cx, cy, w, h float32
-		if e.outTransposed {
-			base := base0 + a*attrs
-			cx = e.outputBuf[base]
-			cy = e.outputBuf[base+1]
-			w = e.outputBuf[base+2]
-			h = e.outputBuf[base+3]
-		} else {
-			cx = e.outputBuf[base0+a]
-			cy = e.outputBuf[base0+anchors+a]
-			w = e.outputBuf[base0+2*anchors+a]
-			h = e.outputBuf[base0+3*anchors+a]
-		}
-		cls, best := -1, conf
-		for c := 0; c < nc; c++ {
-			var s float32
-			if e.outTransposed {
-				s = e.outputBuf[base0+a*attrs+4+c]
-			} else {
-				s = e.outputBuf[base0+(4+c)*anchors+a]
-			}
-			if s > best {
-				best, cls = s, c
-			}
-		}
-		if cls < 0 {
-			continue
-		}
-		cands = append(cands, engine.Box{
-			ClassID:    cls,
-			Confidence: best,
-			X1:         cx - w/2,
-			Y1:         cy - h/2,
-			X2:         cx + w/2,
-			Y2:         cy + h/2,
+// postprocess 解析第 slot 个输出，按类取最大分数并用 NMSIndexed 做按类抑制
+// （按图独立，不跨图抑制）。输出头遍历统一走 yolohead.Walk。
+func (e *Engine) postprocess(v *detectView, slot int, conf float32) []engine.Box {
+	var cands []engine.Box
+	yolohead.Walk(v.buf, slot, v.stride, e.outAnchors, e.outAttrs, e.outAttrs-4, e.outTransposed, conf,
+		func(_, cls int, cx, cy, w, h, score float32, _ []float32) {
+			cands = append(cands, engine.Box{
+				ClassID:    cls,
+				Confidence: score,
+				X1:         cx - w/2,
+				Y1:         cy - h/2,
+				X2:         cx + w/2,
+				Y2:         cy + h/2,
+			})
 		})
+	kept := postprocess.NMSIndexed(len(cands),
+		func(i int) float32 { return cands[i].Confidence },
+		func(i, j int) bool { return cands[i].ClassID == cands[j].ClassID },
+		func(i, j int) float32 { return postprocess.IoU(cands[i], cands[j]) },
+		e.cfg.IoUThresh,
+	)
+	out := make([]engine.Box, 0, len(kept))
+	for _, i := range kept {
+		out = append(out, cands[i])
 	}
-	return postprocess.NMS(cands, e.cfg.IoUThresh)
+	return out
 }
 
 // mapToImage 将 letterbox 坐标映射回原图并转为公共 Detection。

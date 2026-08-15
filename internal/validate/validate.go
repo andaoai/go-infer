@@ -14,7 +14,9 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
+	"runtime"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/andaoai/go-infer/internal/data"
@@ -32,7 +34,11 @@ type Options struct {
 	Split   string          // 数据划分，如 "train2017"
 	Limit   int             // 只校验前 N 张，0=全量
 	Classes []string        // 类别名，用于报告显示
-	Jobs    []Job           // 要跑的引擎列表（检测/分割...），不能为空
+	// Concurrency 是单 Job 内并发推理的 goroutine 数。引擎是否真正合批
+	// 取决于其实现（调用方通常已用 sched 包装，dynamic batching 在调度层
+	// 完成）。0 取 min(runtime.NumCPU(),4)，避免 seg 原型缓冲在小机器上爆内存。
+	Concurrency int
+	Jobs        []Job // 要跑的引擎列表（检测/分割...），不能为空
 }
 
 // Job 是一个待校验的引擎及要计算的指标维度。
@@ -99,7 +105,7 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 	report := &Report{Images: len(samples), Classes: len(opts.Classes)}
 	start := time.Now()
 	for _, job := range opts.Jobs {
-		jr, err := runJob(ctx, job, samples, gts, opts.Classes)
+		jr, err := runJob(ctx, job, samples, gts, opts.Classes, opts.Concurrency)
 		if err != nil {
 			return nil, fmt.Errorf("job %s: %w", job.Name, err)
 		}
@@ -163,26 +169,74 @@ func loadImage(ctx context.Context, st storage.Storage, key string) (image.Image
 	return img, b.Dx(), b.Dy(), nil
 }
 
-func runJob(ctx context.Context, job Job, samples []data.Sample, gts []metric.GroundTruth, classes []string) (JobReport, error) {
+func runJob(ctx context.Context, job Job, samples []data.Sample, gts []metric.GroundTruth, classes []string, concurrency int) (JobReport, error) {
 	jr := JobReport{Name: job.Name, Task: string(job.Engine.Task()), GroundTruths: len(gts)}
 	if len(job.Metrics) == 0 {
 		job.Metrics = []MetricSpec{{Label: "box", UseMask: false}}
 	}
 
-	preds := make([]metric.Prediction, 0, len(samples)*4)
+	workers := concurrency
+	if workers <= 0 {
+		workers = runtime.NumCPU()
+		if workers > 4 {
+			workers = 4
+		}
+	}
+	if workers > len(samples) {
+		workers = len(samples)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	// 每张图推理出的对象按 imageID 写入预留切片；各 goroutine 写不同下标，
+	// 无需加锁。append 到 preds 在 WaitGroup 汇合后单线程进行。
+	objsByImg := make([][]data.Object, len(samples))
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	var firstErr error
+	var errMu sync.Mutex
+
 	jobStart := time.Now()
-	for i, s := range samples {
+	for i := range samples {
 		if err := ctx.Err(); err != nil {
+			// 仍等待已启动的 worker 结束，避免泄漏 goroutine。
+			wg.Wait()
 			return jr, err
 		}
-		res, err := job.Engine.Run(ctx, &engine.Request{Image: s.Image})
-		if err != nil {
-			return jr, fmt.Errorf("第 %d 张推理失败: %w", i, err)
-		}
-		objs, err := data.ObjectsFromResult(res)
-		if err != nil {
-			return jr, fmt.Errorf("结果转换失败: %w", err)
-		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(idx int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			res, err := job.Engine.Run(ctx, &engine.Request{Image: samples[idx].Image})
+			if err != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("第 %d 张推理失败: %w", idx, err)
+				}
+				errMu.Unlock()
+				return
+			}
+			objs, err := data.ObjectsFromResult(res)
+			if err != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("第 %d 张结果转换失败: %w", idx, err)
+				}
+				errMu.Unlock()
+				return
+			}
+			objsByImg[idx] = objs
+		}(i)
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return jr, firstErr
+	}
+
+	preds := make([]metric.Prediction, 0, len(samples)*4)
+	for i, objs := range objsByImg {
 		for _, o := range objs {
 			preds = append(preds, metric.Prediction{ImageID: i, Object: o})
 		}
@@ -190,14 +244,15 @@ func runJob(ctx context.Context, job Job, samples []data.Sample, gts []metric.Gr
 	jr.Predictions = len(preds)
 	jr.TookMs = time.Since(jobStart).Milliseconds()
 
+	// 单次 Evaluate 同时得到 AP@.5、mAP@.5 与 mAP@.50:.95（掩膜只栅格化一次），
+	// 取代原来的 metric.AP + metric.MAPOverThresholds 双调用。
 	for _, spec := range job.Metrics {
-		perClass, mAP50 := metric.AP(preds, gts, 0.50, spec.UseMask)
-		_, mAP5095 := metric.MAPOverThresholds(preds, gts, spec.UseMask)
+		er := metric.Evaluate(preds, gts, spec.UseMask)
 		jr.Metrics = append(jr.Metrics, MetricResult{
 			Label:    spec.Label,
-			MAP50:    mAP50,
-			MAP5095:  mAP5095,
-			PerClass: classAPs(perClass, gts, classes),
+			MAP50:    er.MAP50,
+			MAP5095:  er.MAP5095,
+			PerClass: classAPs(er.PerClass, gts, classes),
 		})
 	}
 	return jr, nil

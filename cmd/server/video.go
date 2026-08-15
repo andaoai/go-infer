@@ -196,7 +196,8 @@ func truncateRune(s string, n int) string {
 
 // Run 驱动一次播放会话。每帧解码出原始 JPEG → cb。
 // 调用方需先 Acquire 成功（这样 503 能在写响应头之前返回）。
-func (v *videoService) Run(ctx context.Context, src string, opts api.RunOpts, cb api.FrameFunc) error {	if !v.Enabled() {
+func (v *videoService) Run(ctx context.Context, src string, opts api.RunOpts, cb api.FrameFunc) error {
+	if !v.Enabled() {
 		return api.ErrVideoDisabled
 	}
 	input, live, err := v.resolveSource(src)

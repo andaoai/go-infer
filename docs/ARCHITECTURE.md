@@ -43,7 +43,7 @@ flowchart TB
         METRIC["metric<br/>IoU / 栅格化 / COCO AP·mAP"]
         CAP["capture<br/>异步采集 + 配额淘汰（Store+Codec）"]
         PROM["promote<br/>采集池合并 + 训练配置（Store+Codec）"]
-        SCHED["sched（规划中）<br/>worker pool / dynamic batching"]
+        SCHED["sched<br/>worker pool / dynamic batching"]
         PRE["preprocess<br/>letterbox / NCHW / NMS"]
         CFG["appcfg / ortenv<br/>类别名 / ORT 初始化"]
     end
@@ -76,17 +76,17 @@ flowchart TB
     API --> Core
     FMT --> DATA
     METRIC --> DATA
-    SCHED -.-> ENG
+    SCHED --> ENG
     DET --> ORT
     SEG --> ORT
     FUTURE -.-> ORT
 
     classDef planned fill:#f4f4f4,stroke:#999,stroke-dasharray:4 4,color:#888;
-    class SCHED,FUTURE planned;
+    class FUTURE planned;
 ```
 
 - **依赖方向无环**：`data`/`storage` 无内部依赖；`format` 与 `metric` 依赖 `data`(+`storage`)；`capture`/`promote` 依赖三者加 `engine`；`cmd/*` 负责把具体实现装配进去。
-- 当前并发模型：引擎内部 `runMu` 串行（共享张量），高并发/攒批能力在规划中的 `internal/sched`。
+- 当前并发模型：`internal/sched` 以 worker pool + 有界队列（背压）包装引擎，CPU 预处理（Prepare）与设备推理（RunBatch）流水线重叠，并在延迟预算内 dynamic batching；引擎内部 `runMu` 仍串行保护共享 ORT session/张量，但 Go 侧后处理（decode/NMS/mask/contour）在锁外执行，与下一批的设备推理重叠。
 - `cmd/validate` 与 `cmd/dataset` 是**纯离线工具**，不启动服务。
 
 ---

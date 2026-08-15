@@ -81,3 +81,57 @@ func maxf(a, b float32) float32 {
 	}
 	return b
 }
+
+// NMSIndexed 是与候选类型无关的按类 NMS：用 accessor 读取分数/同类关系/IoU，
+// 返回保留项的下标（按置信度降序）。detect 与 seg 共用，避免各自维护排序与抑制循环。
+//
+//   - n        候选总数；
+//   - conf     读取第 i 个候选的置信度；
+//   - sameClass 判断 i、j 是否同类（同类才相互抑制）；
+//   - iou      读取 i、j 的 IoU；
+//   - thresh   IoU 超过该值的低分候选被抑制。
+func NMSIndexed(
+	n int,
+	conf func(i int) float32,
+	sameClass func(i, j int) bool,
+	iou func(i, j int) float32,
+	thresh float32,
+) []int {
+	order := make([]int, n)
+	for i := range order {
+		order[i] = i
+	}
+	slices.SortStableFunc(order, func(i, j int) int {
+		ci, cj := conf(i), conf(j)
+		switch {
+		case ci > cj:
+			return -1
+		case ci < cj:
+			return 1
+		default:
+			return 0
+		}
+	})
+	suppressed := make([]bool, n)
+	keep := make([]int, 0, n)
+	for i := 0; i < n; i++ {
+		if suppressed[i] {
+			continue
+		}
+		bi := order[i]
+		keep = append(keep, bi)
+		for j := i + 1; j < n; j++ {
+			if suppressed[j] {
+				continue
+			}
+			bj := order[j]
+			if !sameClass(bi, bj) {
+				continue
+			}
+			if iou(bi, bj) > thresh {
+				suppressed[j] = true
+			}
+		}
+	}
+	return keep
+}
