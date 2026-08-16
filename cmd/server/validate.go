@@ -17,6 +17,7 @@ import (
 	"mime/multipart"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"github.com/andaoai/go-infer/internal/engines/onnxruntime/detect"
 	"github.com/andaoai/go-infer/internal/engines/onnxruntime/seg"
 	"github.com/andaoai/go-infer/internal/format/yolo"
+	"github.com/andaoai/go-infer/internal/sched"
 	"github.com/andaoai/go-infer/internal/storage/local"
 	"github.com/andaoai/go-infer/internal/validate"
 )
@@ -90,6 +92,8 @@ func (v *validateService) Validate(ctx context.Context, req api.ValidateRequest)
 	}
 	defer os.RemoveAll(scratch)
 
+	c := validateConcurrency()
+
 	// 确定数据集来源：上传 zip 或配置的默认测试集。
 	storeRoot, dsPrefix, split, err := v.prepareDataset(scratch, req)
 	if err != nil {
@@ -118,6 +122,7 @@ func (v *validateService) Validate(ctx context.Context, req api.ValidateRequest)
 		Limit:   req.Limit,
 		Classes: classes,
 	}
+	opts.Concurrency = c
 
 	// 检测模型。
 	if req.DetModel != nil {
@@ -133,8 +138,10 @@ func (v *validateService) Validate(ctx context.Context, req api.ValidateRequest)
 			return nil, fmt.Errorf("加载检测模型: %w", err)
 		}
 		defer eng.Close()
+		engSched := sched.New(eng, sched.Config{Workers: c, MaxBatch: 0})
+		defer engSched.Close()
 		opts.Jobs = append(opts.Jobs, validate.Job{
-			Name: "检测模型", Engine: eng, Metrics: []validate.MetricSpec{{Label: "box"}},
+			Name: "检测模型", Engine: engSched, Metrics: []validate.MetricSpec{{Label: "box"}},
 		})
 	}
 
@@ -153,8 +160,10 @@ func (v *validateService) Validate(ctx context.Context, req api.ValidateRequest)
 			return nil, fmt.Errorf("加载分割模型: %w", err)
 		}
 		defer eng.Close()
+		engSegSched := sched.New(eng, sched.Config{Workers: c, MaxBatch: 0})
+		defer engSegSched.Close()
 		opts.Jobs = append(opts.Jobs, validate.Job{
-			Name: "分割模型", Engine: eng,
+			Name: "分割模型", Engine: engSegSched,
 			Metrics: []validate.MetricSpec{{Label: "box"}, {Label: "mask", UseMask: true}},
 		})
 	}
@@ -395,4 +404,18 @@ func cleanupStaleScratch(dir string) {
 			_ = os.RemoveAll(filepath.Join(dir, e.Name()))
 		}
 	}
+}
+
+// validateConcurrency 返回网页/CLI 校验引擎的并发度：与 validate.Options
+// 的默认策略一致（min(NumCPU,4)），sched worker 数与 validate 推理并发度
+// 对齐，dynamic batching 由调度层完成。
+func validateConcurrency() int {
+	c := runtime.NumCPU()
+	if c > 4 {
+		c = 4
+	}
+	if c < 1 {
+		c = 1
+	}
+	return c
 }

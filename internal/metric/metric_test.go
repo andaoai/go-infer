@@ -2,6 +2,7 @@ package metric
 
 import (
 	"image"
+	"math/rand"
 	"testing"
 
 	"github.com/andaoai/go-infer/internal/data"
@@ -96,4 +97,71 @@ func about(a, b, eps float64) bool {
 		d = -d
 	}
 	return d < eps
+}
+
+// TestEvaluateMatchesAPAndMAPOverThresholds 验证统一 Evaluate 与历史的
+// AP + MAPOverThresholds 在 box 和 mask 两种匹配下逐位一致。
+func TestEvaluateMatchesAPAndMAPOverThresholds(t *testing.T) {
+	rng := rand.New(rand.NewSource(2024))
+	mkBox := func(x, y, s int) data.BBox {
+		return data.BBox{X1: float32(x), Y1: float32(y), X2: float32(x + s), Y2: float32(y + s)}
+	}
+	mkRing := func(x, y, s int) [][]data.Point {
+		return [][]data.Point{{
+			{X: float32(x), Y: float32(y)},
+			{X: float32(x + s), Y: float32(y)},
+			{X: float32(x + s), Y: float32(y + s)},
+			{X: float32(x), Y: float32(y + s)},
+		}}
+	}
+	for iter := 0; iter < 100; iter++ {
+		imgs := 2 + rng.Intn(4)
+		var gts []GroundTruth
+		var preds []Prediction
+		for img := 0; img < imgs; img++ {
+			nGT := rng.Intn(5)
+			for i := 0; i < nGT; i++ {
+				cls := rng.Intn(3)
+				x, y, s := rng.Intn(80), rng.Intn(80), 10+rng.Intn(20)
+				gts = append(gts, GroundTruth{
+					ImageID: img, W: 100, H: 100,
+					Object: data.Object{ClassID: cls, BBox: mkBox(x, y, s), Rings: mkRing(x, y, s)},
+				})
+			}
+			nP := rng.Intn(6)
+			for i := 0; i < nP; i++ {
+				cls := rng.Intn(3)
+				x, y, s := rng.Intn(80), rng.Intn(80), 10+rng.Intn(20)
+				jx, jy := x, y
+				if rng.Intn(2) == 0 {
+					jx += rng.Intn(6) - 3
+				}
+				preds = append(preds, Prediction{
+					ImageID: img,
+					Object: data.Object{
+						ClassID: cls, Confidence: float32(rng.Float64()),
+						BBox: mkBox(jx, jy, s), Rings: mkRing(jx, jy, s),
+					},
+				})
+			}
+		}
+		for _, useMask := range []bool{false, true} {
+			er := Evaluate(preds, gts, useMask)
+			apClasses, ap50 := AP(preds, gts, 0.50, useMask)
+			map50Leg, map5095Leg := MAPOverThresholds(preds, gts, useMask)
+			if !about(er.MAP50, ap50, 1e-9) {
+				t.Fatalf("iter %d mask=%v: MAP50 %.6f != AP.mAP %.6f", iter, useMask, er.MAP50, ap50)
+			}
+			if !about(er.MAP50, map50Leg, 1e-9) || !about(er.MAP5095, map5095Leg, 1e-9) {
+				t.Fatalf("iter %d mask=%v: Evaluate(%g,%g) != MAPOverThresholds(%g,%g)",
+					iter, useMask, er.MAP50, er.MAP5095, map50Leg, map5095Leg)
+			}
+			for c, ap := range apClasses {
+				if !about(er.PerClass[c], ap, 1e-9) {
+					t.Fatalf("iter %d mask=%v class %d: PerClass %.6f != AP %.6f",
+						iter, useMask, c, er.PerClass[c], ap)
+				}
+			}
+		}
+	}
 }

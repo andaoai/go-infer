@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/andaoai/go-infer/internal/format"
+	"github.com/andaoai/go-infer/internal/fsx"
 	"github.com/andaoai/go-infer/internal/storage"
 )
 
@@ -105,16 +106,16 @@ func Run(opts Options) (*Result, error) {
 	enginesTouched := touchedEngines(res)
 	for _, eng := range enginesTouched {
 		if w, ok := opts.Codec.(format.DatasetConfigWriter); ok {
-			dsRoot := keyJoin(opts.DatasetRoot, eng)
+			dsRoot := fsx.Join(opts.DatasetRoot, eng)
 			cfgRoot := dsRoot
 			if opts.ConfigRoot != "" {
-				cfgRoot = keyJoin(opts.ConfigRoot, eng)
+				cfgRoot = fsx.Join(opts.ConfigRoot, eng)
 			}
 			if err := w.WriteDatasetConfig(ctx, opts.Store, dsRoot, cfgRoot, opts.Classes); err != nil {
 				return nil, fmt.Errorf("写数据集配置 (%s): %w", eng, err)
 			}
 			if opts.Engine != "" && len(enginesTouched) == 1 {
-				res.DataYAML = keyJoin(dsRoot, "data.yaml")
+				res.DataYAML = fsx.Join(dsRoot, "data.yaml")
 			}
 		}
 	}
@@ -128,8 +129,8 @@ func Run(opts Options) (*Result, error) {
 }
 
 func promoteDate(ctx context.Context, opts Options, eng, date string) (int, error) {
-	srcPrefix := keyJoin(opts.PoolRoot, eng, date)
-	dstImgPrefix := keyJoin(opts.DatasetRoot, eng, "images", "train")
+	srcPrefix := fsx.Join(opts.PoolRoot, eng, date)
+	dstImgPrefix := fsx.Join(opts.DatasetRoot, eng, "images", "train")
 
 	infos, err := opts.Store.List(ctx, srcPrefix)
 	if err != nil {
@@ -143,7 +144,7 @@ func promoteDate(ctx context.Context, opts Options, eng, date string) (int, erro
 		stem := strings.TrimSuffix(filepath.Base(in.Key), filepath.Ext(in.Key))
 		ext := filepath.Ext(in.Key)
 		newStem := date + "_" + stem
-		dstImg := keyJoin(dstImgPrefix, newStem+ext)
+		dstImg := fsx.Join(dstImgPrefix, newStem+ext)
 		dstLbl := opts.Codec.LabelKey(dstImg)
 		srcLbl := opts.Codec.LabelKey(in.Key)
 
@@ -188,7 +189,7 @@ func transfer(ctx context.Context, st storage.Storage, move bool, src, dst strin
 // listEngines 列出采集池下的引擎目录（key 的第一段）。
 func listEngines(ctx context.Context, opts Options, only string) ([]string, error) {
 	if only != "" {
-		if _, err := opts.Store.Stat(ctx, keyJoin(opts.PoolRoot, only)); err != nil {
+		if _, err := opts.Store.Stat(ctx, fsx.Join(opts.PoolRoot, only)); err != nil {
 			return nil, nil // 过滤不存在的引擎，静默
 		}
 		return []string{only}, nil
@@ -198,9 +199,9 @@ func listEngines(ctx context.Context, opts Options, only string) ([]string, erro
 
 // listDates 列出某引擎下的日期目录（key 的第二段）。
 func listDates(ctx context.Context, opts Options, eng, only string) ([]string, error) {
-	base := keyJoin(opts.PoolRoot, eng)
+	base := fsx.Join(opts.PoolRoot, eng)
 	if only != "" {
-		if _, err := opts.Store.Stat(ctx, keyJoin(base, only)); err != nil {
+		if _, err := opts.Store.Stat(ctx, fsx.Join(base, only)); err != nil {
 			return nil, nil
 		}
 		return []string{only}, nil
@@ -251,7 +252,7 @@ func writeManifest(ctx context.Context, opts Options, res *Result) (string, erro
 	if opts.Engine != "" {
 		name = opts.Engine
 	}
-	key := keyJoin(opts.DatasetRoot, "versions", name+"-"+stamp+".json")
+	key := fsx.Join(opts.DatasetRoot, "versions", name+"-"+stamp+".json")
 	data, err := json.MarshalIndent(res, "", "  ")
 	if err != nil {
 		return "", err
@@ -260,15 +261,4 @@ func writeManifest(ctx context.Context, opts Options, res *Result) (string, erro
 		return "", err
 	}
 	return key, nil
-}
-
-// keyJoin 用正斜杠拼接存储 key。
-func keyJoin(parts ...string) string {
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if p != "" {
-			out = append(out, filepath.ToSlash(p))
-		}
-	}
-	return strings.Join(out, "/")
 }

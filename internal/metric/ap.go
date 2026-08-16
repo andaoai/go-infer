@@ -19,12 +19,58 @@ type GroundTruth struct {
 	W, H    int
 }
 
-// AP 计算全部类别的平均精度（AP），返回各类 AP 和总体 mAP。
+// EvalResult 是一次评测的完整指标：PerClass 为各类 AP@.5，MAP50 为其在
+// 有 GT 类别上的平均，MAP5095 为 COCO 风格十阈值平均。
+type EvalResult struct {
+	PerClass map[int]float64
+	MAP50    float64
+	MAP5095  float64
+}
+
+// Evaluate 对 preds/gts 做一次匹配（掩膜只栅格化一次），同时计算 AP@.5、
+// mAP@.5 与 mAP@[.50:.95]。供 validate 等上层使用，避免对同一批预测重复
+// 调 AP + MAPOverThresholds（后者会再做一次 buildMatches 与掩膜栅格化）。
 //
 // useMask=false 时按框 IoU 匹配；useMask=true 时按多边形掩膜 IoU 匹配。
+func Evaluate(preds []Prediction, gts []GroundTruth, useMask bool) EvalResult {
+	matches := buildMatches(preds, gts, useMask)
+
+	perClass := make(map[int]float64, len(matches))
+	var sum50 float64
+	n := 0
+	for c, cm := range matches {
+		ap := classAP(cm, 0.50)
+		perClass[c] = ap
+		if cm.nGT > 0 {
+			sum50 += ap
+			n++
+		}
+	}
+	map50 := 0.0
+	if n > 0 {
+		map50 = sum50 / float64(n)
+	}
+
+	var sumT float64
+	for t := 0.50; t <= 0.95001; t += 0.05 {
+		sumT += mAPFromMatches(matches, roundT(t))
+	}
+	map5095 := sumT / 10.0
+
+	return EvalResult{PerClass: perClass, MAP50: map50, MAP5095: map5095}
+}
+
+// AP 计算全部类别的平均精度（AP），返回各类 AP 和总体 mAP@.5。
+//
 // 采用 COCO 评测惯例：按类分组，预测按置信度降序，贪心匹配同类中 IoU
-// 最高且未被占用的 GT，累积 TP/FP 后用全点插值计算单类 AP。
+// 最高且未被占用的 GT，累积 TP/FP 后用全点插值计算单类 AP。保留作为薄
+// 包装供现有测试/调用方使用，内部委托 Evaluate（单次匹配）。
 func AP(preds []Prediction, gts []GroundTruth, iouThresh float64, useMask bool) (perClass map[int]float64, mAP float64) {
+	if iouThresh == 0.50 {
+		er := Evaluate(preds, gts, useMask)
+		return er.PerClass, er.MAP50
+	}
+	// 非 .5 的自定义阈值：仍走单次 buildMatches，但按该阈值算各类 AP。
 	matches := buildMatches(preds, gts, useMask)
 	perClass = map[int]float64{}
 	var sum float64
@@ -190,16 +236,11 @@ func classAP(cm *classMatches, iouThresh float64) float64 {
 }
 
 // MAPOverThresholds 返回 COCO 风格 mAP@[0.50:0.95]（步长 0.05，共 10 个阈值），
-// 以及 mAP@0.5。匹配只计算一次，掩膜只栅格化一次，多阈值共享。
+// 以及 mAP@0.5。匹配只计算一次，掩膜只栅格化一次，多阈值共享。保留作为薄
+// 包装供现有测试/调用方使用，内部委托 Evaluate。
 func MAPOverThresholds(preds []Prediction, gts []GroundTruth, useMask bool) (map50, map5095 float64) {
-	matches := buildMatches(preds, gts, useMask)
-	map50 = mAPFromMatches(matches, 0.50)
-	var sum float64
-	for t := 0.50; t <= 0.95001; t += 0.05 {
-		sum += mAPFromMatches(matches, roundT(t))
-	}
-	map5095 = sum / 10.0
-	return map50, map5095
+	er := Evaluate(preds, gts, useMask)
+	return er.MAP50, er.MAP5095
 }
 
 // mAPFromMatches 在已有匹配上按阈值计算 mAP（只对 GT 中出现的类求平均）。

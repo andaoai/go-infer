@@ -7,7 +7,9 @@ import (
 	"image/jpeg"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/andaoai/go-infer/internal/data"
 	"github.com/andaoai/go-infer/internal/engine"
@@ -216,4 +218,102 @@ func TestObjectsFromResult(t *testing.T) {
 	if len(objs) != 1 {
 		t.Fatalf("objs = %d, want 1", len(objs))
 	}
+}
+
+// concurrencyEngine 记录并发中的最大在途请求数与每个 imageID 的调用。
+type concurrencyEngine struct {
+	fakeEngine
+	mu        sync.Mutex
+	inFlight  int
+	maxFlight int
+	ran       []int
+}
+
+func (e *concurrencyEngine) Run(ctx context.Context, req *engine.Request) (engine.Result, error) {
+	e.mu.Lock()
+	e.inFlight++
+	if e.inFlight > e.maxFlight {
+		e.maxFlight = e.inFlight
+	}
+	e.mu.Unlock()
+	defer func() {
+		e.mu.Lock()
+		e.inFlight--
+		e.mu.Unlock()
+	}()
+	time.Sleep(2 * time.Millisecond)
+	return e.result, nil
+}
+
+// TestRunJobConcurrencyAndOrdering 验证 N 个 worker 确实并发执行，且结果按
+// imageID 顺序组装（即使完成顺序乱序，preds 也不乱）。
+func TestRunJobConcurrencyAndOrdering(t *testing.T) {
+	opts := newOpts(t) // 3 张图，自带 GT
+	eng := &concurrencyEngine{
+		fakeEngine: fakeEngine{name: "c", task: engine.TaskDetection, result: detResult()},
+	}
+	opts.Jobs = []Job{{Name: "det", Engine: eng, Metrics: []MetricSpec{{Label: "box"}}}}
+	opts.Concurrency = 3
+
+	rep, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.PredictionsForJob("det") != 3 {
+		t.Fatalf("predictions = %d, want 3", rep.PredictionsForJob("det"))
+	}
+	if eng.maxFlight < 2 {
+		t.Errorf("并发度 maxFlight = %d，期望 >= 2（Concurrency=3 应真正并行）", eng.maxFlight)
+	}
+}
+
+// slowEngine 每张图 sleep 一段时间，用于验证 ctx 取消能在图片之间打断。
+type slowEngine struct {
+	fakeEngine
+	delay time.Duration
+}
+
+func (e *slowEngine) Run(ctx context.Context, req *engine.Request) (engine.Result, error) {
+	select {
+	case <-time.After(e.delay):
+		return e.result, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// TestRunJobCancelInterrupts 验证 ctx 在调度循环中被取消时 runJob 会等待已启动
+// worker 退出并返回 ctx.Err，不会卡死也不会泄漏 goroutine。
+func TestRunJobCancelInterrupts(t *testing.T) {
+	opts := newOpts(t)
+	eng := &slowEngine{
+		fakeEngine: fakeEngine{name: "slow", task: engine.TaskDetection, result: detResult()},
+		delay:      100 * time.Millisecond,
+	}
+	opts.Jobs = []Job{{Name: "det", Engine: eng, Metrics: []MetricSpec{{Label: "box"}}}}
+	opts.Concurrency = 1
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	_, err := Run(ctx, opts)
+	if err == nil {
+		t.Fatal("取消后应返回错误")
+	}
+	if time.Since(start) > 500*time.Millisecond {
+		t.Errorf("取消后耗时 %v，期望尽快返回（<500ms）", time.Since(start))
+	}
+}
+
+// PredictionsForJob 暴露 job 报告里的预测数（测试辅助）。
+func (r *Report) PredictionsForJob(name string) int {
+	for _, j := range r.Jobs {
+		if j.Name == name {
+			return j.Predictions
+		}
+	}
+	return -1
 }

@@ -3,7 +3,8 @@
 // session.Run -> 逐槽后处理" 的统一骨架。
 //
 // detect/seg 等具体引擎内嵌 *Runtime，只需提供输出形状解析、自有的输出缓冲，以及两个
-// 回调：BuildOutput（按本次 batch n 在自有输出缓冲上建张量）和 PostSlot（逐槽解码）。
+// 回调：BuildOutput（按本次 batch n 在自有输出缓冲上建张量，返回持有底层 []float32
+// 的视图 view）和 PostSlot（解锁后逐槽解码，从 view 读输出）。
 // 这避免了每个 YOLO 头重复抄写约 150 行相同的加锁/copy/张量/计时样板。
 package ortbatch
 
@@ -39,11 +40,20 @@ type Output struct {
 
 // BuildOutput 由引擎提供：基于本次 batch n，在引擎自有的输出缓冲切片上构造具体
 // 形状的输出张量。返回的 Output.Values 顺序必须与 Config.OutputNames 一致。
-type BuildOutput func(n int) (Output, error)
+//
+// 返回的 view 是一个不透明持有物：RunBatch 在解锁后会原样传给每个 PostSlot，
+// 引擎可在其中放入本次批输出缓冲的切片/stride。PostSlot 必须【同步】消费 view：
+// 一旦所有 PostSlot 返回，缓冲可能被池化复用；在 PostSlot 内另起 goroutine
+// 读取 view 会产生数据竞态。
+type BuildOutput func(n int) (out Output, view any, err error)
 
 // PostSlot 由引擎提供：对第 slot 个输出做引擎私有的后处理（解码/NMS/坐标映射/掩膜），
 // 返回该槽的结果。p.Meta 的动态类型为 *Meta。
-type PostSlot func(slot int, p *engine.Prepared, elapsed time.Duration) (engine.Result, error)
+//
+// view 来自同次 BuildOutput；调用发生在设备锁之外（session.Run 已返回、ORT
+// 不再引用输出张量），多槽的后处理可与下一批 session.Run 在设备侧重叠。实现
+// 必须在返回前读完 view，不得把 view 透传至异步 goroutine。
+type PostSlot func(slot int, p *engine.Prepared, view any, elapsed time.Duration) (engine.Result, error)
 
 // Config 构造共享运行时。InputDims 仅用于解析 batch 上限（dim0）。
 type Config struct {
@@ -158,18 +168,22 @@ func (r *Runtime) RunOnce(ctx context.Context, req *engine.Request, buildOut Bui
 	return results[0], nil
 }
 
-// RunBatch 在一次底层推理中处理 n 张已预处理的图：加锁 -> copy 输入 -> 建输入/输出
-// 张量 -> session.Run -> 逐槽 post。整批成功或整批失败；n∈[1,MaxBatch]。
+// RunBatch 在一次底层推理中处理 n 张已预处理的图：锁内 copy 输入 -> 建输入/输出
+// 张量 -> session.Run -> 记录 elapsed；解锁后再逐槽调 post，全部 post 结束后才
+// 调 out.Done() 归还输出张量/缓冲。这样 Go 侧后处理（解码/NMS/掩膜/轮廓）不再
+// 占用设备锁，下一批 session.Run 可与其后处理重叠。整批成功或整批失败；
+// n∈[1,MaxBatch]。
 func (r *Runtime) RunBatch(ctx context.Context, batch []*engine.Prepared, buildOut BuildOutput, post PostSlot) ([]engine.Result, error) {
 	n := len(batch)
 	if n == 0 || n > r.maxBatch {
 		return nil, fmt.Errorf("invalid batch size %d (max %d)", n, r.maxBatch)
 	}
 
+	// 设备锁：只覆盖"拷输入 + 建张量 + session.Run"，绝不包含后处理。
 	r.runMu.Lock()
-	defer r.runMu.Unlock()
 
 	if err := ctx.Err(); err != nil {
+		r.runMu.Unlock()
 		return nil, err
 	}
 
@@ -184,27 +198,38 @@ func (r *Runtime) RunBatch(ctx context.Context, batch []*engine.Prepared, buildO
 		r.inputBuf[:n*r.planeSize],
 	)
 	if err != nil {
+		r.runMu.Unlock()
 		return nil, fmt.Errorf("create input tensor: %w", err)
 	}
 	defer in.Destroy()
 
-	out, err := buildOut(n)
+	out, view, err := buildOut(n)
 	if err != nil {
+		r.runMu.Unlock()
 		return nil, err
 	}
-	if out.Done != nil {
-		defer out.Done()
-	}
+	// out.Done 必须在所有 post 结束后才调用：它负责销毁 ORT 输出张量并把
+	// 池化缓冲放回 sync.Pool；提前回池会让 post 读到被复用的数据。
+	defer func() {
+		if out.Done != nil {
+			out.Done()
+		}
+	}()
 
 	start := time.Now()
 	if err := r.session.Run([]ort.Value{in}, out.Values); err != nil {
+		r.runMu.Unlock()
 		return nil, fmt.Errorf("inference: %w", err)
 	}
 	elapsed := time.Since(start)
 
+	// session.Run 已同步返回：此后 ORT 不再写输出张量。解锁让下一批能立刻
+	// 进入 session.Run，同时本批的 Go 后处理在锁外进行。
+	r.runMu.Unlock()
+
 	results := make([]engine.Result, n)
 	for i, p := range batch {
-		results[i], err = post(i, p, elapsed)
+		results[i], err = post(i, p, view, elapsed)
 		if err != nil {
 			return nil, err
 		}

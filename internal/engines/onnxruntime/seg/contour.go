@@ -10,52 +10,59 @@ type point struct{ x, y int }
 //  2. 每个连通域取最上最左的边界点做 Moore 邻域外轮廓追踪
 //  3. RDP 算法压缩共线点
 //
+// mask 与 labels 均由调用方提供（len(mask)==len(labels)==w*h）；labels 被
+// 复用作连通域标记缓冲，contour 不自行分配这两块 O(bw×bh) 的内存。
 // 掩膜坐标原点在左上角，x 向右、y 向下。
-func contour(mask []bool, w, h int) [][]point {
-	if w <= 0 || h <= 0 || len(mask) != w*h {
+func contour(mask []bool, labels []int, w, h int) [][]point {
+	if w <= 0 || h <= 0 || len(mask) != w*h || len(labels) != w*h {
 		return nil
 	}
-
-	labels := make([]int, len(mask))
-	type component struct {
-		pixels []int
-		label  int
+	for i := range labels {
+		labels[i] = 0
 	}
-	var components []component
+
+	type comp struct {
+		label  int
+		sx, sy int // 最上最左起点
+	}
+	var comps []comp
 	nextLabel := 1
 
-	// 8-连通洪水填充标记。
+	// 8-连通洪水填充标记；floodFill 直接记录最上最左像素，不再累积 pixels。
 	for y := 0; y < h; y++ {
 		for x := 0; x < w; x++ {
 			idx := y*w + x
 			if !mask[idx] || labels[idx] != 0 {
 				continue
 			}
-			pixels := floodFill(mask, labels, w, h, x, y, nextLabel)
-			components = append(components, component{pixels, nextLabel})
+			sx, sy := floodFill(mask, labels, w, h, x, y, nextLabel)
+			comps = append(comps, comp{label: nextLabel, sx: sx, sy: sy})
 			nextLabel++
 		}
 	}
 
 	var polys [][]point
-	for _, c := range components {
-		if poly := traceOuter(mask, labels, w, h, c.pixels, c.label); len(poly) >= 3 {
+	for _, c := range comps {
+		if poly := traceOuter(mask, labels, w, h, c.sx, c.sy, c.label); len(poly) >= 3 {
 			polys = append(polys, simplify(poly))
 		}
 	}
 	return polys
 }
 
-// floodFill 从 (sx,sy) 做 8-连通 BFS，标记 label 并返回该连通域所有像素下标。
-func floodFill(mask []bool, labels []int, w, h, sx, sy, label int) []int {
+// floodFill 从 (sx,sy) 做 8-连通 BFS，标记 label 并返回该连通域最上最左的
+// 像素坐标（遍历时按行扫描顺序天然先遇到 y 较小、同行 x 较小者）。
+func floodFill(mask []bool, labels []int, w, h, sx, sy, label int) (int, int) {
 	stack := []int{sy*w + sx}
 	labels[stack[0]] = label
-	var pixels []int
+	topX, topY := sx, sy
 	for len(stack) > 0 {
 		idx := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
-		pixels = append(pixels, idx)
 		x, y := idx%w, idx/w
+		if y < topY || (y == topY && x < topX) {
+			topX, topY = x, y
+		}
 		for dy := -1; dy <= 1; dy++ {
 			ny := y + dy
 			if ny < 0 || ny >= h {
@@ -77,7 +84,7 @@ func floodFill(mask []bool, labels []int, w, h, sx, sy, label int) []int {
 			}
 		}
 	}
-	return pixels
+	return topX, topY
 }
 
 // 8-邻域，顺序：从正上方开始顺时针。
@@ -88,18 +95,10 @@ var nbr8 = [8][2]int{
 
 // traceOuter 用 Moore 邻域追踪单个连通域（标签 compLabel）的外轮廓。
 //
-// 取该连通域最上最左的边界像素为起点，沿邻域顺时针绕行一周回到起点。
-// 只把属于本连通域的像素当作"前景"，避免穿到其他实例（即使它们也在掩膜中）。
-func traceOuter(mask []bool, labels []int, w, h int, pixels []int, compLabel int) []point {
-	// 找最上最左像素（y 最小，同 y 取 x 最小）——它一定是外边界点。
-	sx, sy := w, h
-	for _, idx := range pixels {
-		x, y := idx%w, idx/w
-		if y < sy || (y == sy && x < sx) {
-			sx, sy = x, y
-		}
-	}
-
+// (sx,sy) 是该连通域最上最左的边界像素（由 floodFill 给出），沿邻域顺时针
+// 绕行一周回到起点。只把属于本连通域的像素当作"前景"，避免穿到其他实例
+// （即使它们也在掩膜中）。
+func traceOuter(mask []bool, labels []int, w, h, sx, sy, compLabel int) []point {
 	var poly []point
 	x, y := sx, sy
 	// backDir 是"我们从哪个方向进入当前像素"的邻域索引；下一个候选从

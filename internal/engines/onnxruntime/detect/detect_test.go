@@ -59,20 +59,21 @@ func TestPostprocessSlotIsolation(t *testing.T) {
 		outAttrs: 5, outAnchors: 3, outTransposed: false,
 		cfg:       Config{Classes: []string{"obj"}, ConfThresh: 0.25, IoUThresh: 0.45},
 		outStride: 5 * 3,
-		outputBuf: make([]float32, 2*5*3),
 	}
+	buf := make([]float32, 2*5*3)
 	// slot 1, anchor 2: cx=10 cy=20 w=4 h=6, class0=0.9
 	base := 1*e.outStride + 2 // cx 偏移 (base0 + 0*anchors + a)
-	e.outputBuf[base] = 10
-	e.outputBuf[base+e.outAnchors] = 20
-	e.outputBuf[base+2*e.outAnchors] = 4
-	e.outputBuf[base+3*e.outAnchors] = 6
-	e.outputBuf[base+4*e.outAnchors] = 0.9
+	buf[base] = 10
+	buf[base+e.outAnchors] = 20
+	buf[base+2*e.outAnchors] = 4
+	buf[base+3*e.outAnchors] = 6
+	buf[base+4*e.outAnchors] = 0.9
+	v := &detectView{buf: buf, stride: e.outStride}
 
-	if boxes := e.postprocess(0, 0.25); len(boxes) != 0 {
+	if boxes := e.postprocess(v, 0, 0.25); len(boxes) != 0 {
 		t.Fatalf("slot 0 should be empty, got %d", len(boxes))
 	}
-	boxes := e.postprocess(1, 0.25)
+	boxes := e.postprocess(v, 1, 0.25)
 	if len(boxes) != 1 {
 		t.Fatalf("slot 1 want 1 box, got %d", len(boxes))
 	}

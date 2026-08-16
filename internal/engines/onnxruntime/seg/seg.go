@@ -14,10 +14,12 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/andaoai/go-infer/internal/engine"
 	"github.com/andaoai/go-infer/internal/engines/onnxruntime/ortbatch"
+	"github.com/andaoai/go-infer/internal/engines/onnxruntime/yolohead"
 	"github.com/andaoai/go-infer/internal/postprocess"
 	"github.com/andaoai/go-infer/internal/preprocess"
 	ort "github.com/yalue/onnxruntime_go"
@@ -37,17 +39,34 @@ type Config struct {
 	MaxBatch int
 }
 
+// segView 是一次 RunBatch 的输出视图：detBuf/protoBuf 是同一块池化缓冲
+// 的两段切片，postSlot 在设备锁之外同步读取；Done 后整块回池。
+type segView struct {
+	detBuf      []float32 // 前 n*detStride 个元素
+	protoBuf    []float32 // 紧接其后 n*protoStride 个元素
+	detStride   int
+	protoStride int
+}
+
+// maskScratch 是 makeMasks/contour 复用的掩膜与连通域标记缓冲，按输入面积
+// 一次性分配，经 sync.Pool 在并发的 postSlot 之间复用。
+type maskScratch struct {
+	mask   []bool
+	labels []int
+}
+
 // Engine 是 engine.Engine / engine.BatchEngine 的 ONNX Runtime YOLOv8-seg 实现。
 // 输入缓冲、session、pool 与设备锁由内嵌的 *ortbatch.Runtime 管理；本结构只保留
-// 检测头/原型输出形状与输出缓冲。
+// 检测头/原型输出形状、池化输出缓冲与掩膜临时缓冲。
 type Engine struct {
 	*ortbatch.Runtime
 	cfg Config
 
-	detBuf      []float32 // maxBatch*detStride
-	protoBuf    []float32 // maxBatch*protoStride
-	detStride   int       // anchors*attrs，每图检测头元素数
-	protoStride int       // nm*mh*mw，每图原型元素数
+	outPool     sync.Pool // 借出 []float32，len = MaxBatch()*(detStride+protoStride)
+	scratchPool sync.Pool // 借出 *maskScratch，mask/labels 容量为 InputW*InputH
+
+	detStride   int // anchors*attrs，每图检测头元素数
+	protoStride int // nm*mh*mw，每图原型元素数
 
 	// 检测头布局
 	anchors    int
@@ -57,6 +76,8 @@ type Engine struct {
 	transposed bool
 	// 原型掩膜
 	maskH, maskW int
+	// maskLogitThr = -log(1/thr - 1)；掩膜 logit 和 >= 它等价于 sigmoid(sum) >= thr。
+	maskLogitThr float32
 }
 
 // New 创建并初始化 seg 引擎。
@@ -118,21 +139,44 @@ func New(cfg Config) (*Engine, error) {
 
 	detStride := anchors * attrs
 	protoStride := nm * mh * mw
-	return &Engine{
-		Runtime:     rt,
-		cfg:         cfg,
-		detBuf:      make([]float32, rt.MaxBatch()*detStride),
-		protoBuf:    make([]float32, rt.MaxBatch()*protoStride),
-		detStride:   detStride,
-		protoStride: protoStride,
-		anchors:     anchors,
-		attrs:       attrs,
-		nc:          nc,
-		nm:          nm,
-		transposed:  transposed,
-		maskH:       mh,
-		maskW:       mw,
-	}, nil
+	e := &Engine{
+		Runtime:      rt,
+		cfg:          cfg,
+		detStride:    detStride,
+		protoStride:  protoStride,
+		anchors:      anchors,
+		attrs:        attrs,
+		nc:           nc,
+		nm:           nm,
+		transposed:   transposed,
+		maskH:        mh,
+		maskW:        mw,
+		maskLogitThr: logitFromProb(cfg.MaskThresh),
+	}
+	e.outPool.New = func() any {
+		return make([]float32, rt.MaxBatch()*(detStride+protoStride))
+	}
+	area := cfg.InputW * cfg.InputH
+	e.scratchPool.New = func() any {
+		return &maskScratch{
+			mask:   make([]bool, area),
+			labels: make([]int, area),
+		}
+	}
+	return e, nil
+}
+
+// logitFromProb 计算 logit(p)=log(p/(1-p))=-log(1/p-1)，对 p 做 [1e-4,1-1e-4]
+// 保护，避免用户传 0/1 产生 ±Inf 让掩膜全删/全保。
+func logitFromProb(p float32) float32 {
+	const eps = 1e-4
+	if p < eps {
+		p = eps
+	}
+	if p > 1-eps {
+		p = 1 - eps
+	}
+	return float32(-math.Log(float64(1.0/p - 1.0)))
 }
 
 func (e *Engine) Name() string      { return e.cfg.Name }
@@ -149,132 +193,115 @@ func (e *Engine) RunBatch(ctx context.Context, batch []*engine.Prepared) ([]engi
 	return e.Runtime.RunBatch(ctx, batch, e.buildOutput, e.postSlot)
 }
 
-// buildOutput 在引擎自有 detBuf/protoBuf 上按本次 batch n 构造检测头与原型两个输出张量。
-func (e *Engine) buildOutput(n int) (ortbatch.Output, error) {
+// buildOutput 从池中借出一整块输出缓冲，前 n*detStride 给检测头、紧接其后的
+// n*protoStride 给原型，分别建两个张量别名这两段；Done 销毁两个张量并整块回池。
+func (e *Engine) buildOutput(n int) (ortbatch.Output, any, error) {
+	full := e.outPool.Get().([]float32)
+	detBuf := full[:n*e.detStride]
+	protoBuf := full[n*e.detStride : n*(e.detStride+e.protoStride)]
+
 	var detShape ort.Shape
 	if e.transposed {
 		detShape = ort.NewShape(int64(n), int64(e.anchors), int64(e.attrs))
 	} else {
 		detShape = ort.NewShape(int64(n), int64(e.attrs), int64(e.anchors))
 	}
-	detOut, err := ort.NewTensor(detShape, e.detBuf[:n*e.detStride])
+	detOut, err := ort.NewTensor(detShape, detBuf)
 	if err != nil {
-		return ortbatch.Output{}, fmt.Errorf("create det tensor: %w", err)
+		e.outPool.Put(full)
+		return ortbatch.Output{}, nil, fmt.Errorf("create det tensor: %w", err)
 	}
 	protoTensor, err := ort.NewTensor(
 		ort.NewShape(int64(n), int64(e.nm), int64(e.maskH), int64(e.maskW)),
-		e.protoBuf[:n*e.protoStride],
+		protoBuf,
 	)
 	if err != nil {
 		detOut.Destroy()
-		return ortbatch.Output{}, fmt.Errorf("create proto tensor: %w", err)
+		e.outPool.Put(full)
+		return ortbatch.Output{}, nil, fmt.Errorf("create proto tensor: %w", err)
 	}
 	return ortbatch.Output{
-		Values: []ort.Value{detOut, protoTensor},
-		Done:   func() { detOut.Destroy(); protoTensor.Destroy() },
-	}, nil
+			Values: []ort.Value{detOut, protoTensor},
+			Done: func() {
+				detOut.Destroy()
+				protoTensor.Destroy()
+				e.outPool.Put(full)
+			},
+		}, &segView{
+			detBuf:      detBuf,
+			protoBuf:    protoBuf,
+			detStride:   e.detStride,
+			protoStride: e.protoStride,
+		}, nil
 }
 
 // postSlot 对第 slot 个输出解码、NMS、生成掩膜并映射回原图。
-func (e *Engine) postSlot(slot int, p *engine.Prepared, elapsed time.Duration) (engine.Result, error) {
+func (e *Engine) postSlot(slot int, p *engine.Prepared, view any, elapsed time.Duration) (engine.Result, error) {
 	m := p.Meta.(*ortbatch.Meta)
-	cands := e.decodeDetections(slot, m.Conf)
+	v := view.(*segView)
+	cands := e.decodeDetections(v, slot, m.Conf)
 	kept := e.nms(cands)
-	instances := e.makeMasks(slot, kept, m)
+	instances := e.makeMasks(v, slot, kept, m)
 	return &engine.SegmentationResult{Elapsed: elapsed, Instances: instances}, nil
 }
 
 type cand struct {
 	box    engine.Box
-	coeffs []float32 // 长度 nm
+	coeffs []float32 // 长度 nm；从检测头复制一份，供 makeMasks 在锁外使用
 }
 
 // decodeDetections 解析第 slot 个检测头：cx cy w h + nc 类别分 + nm 掩膜系数。
-func (e *Engine) decodeDetections(slot int, conf float32) []cand {
-	nc, nm, anchors := e.nc, e.nm, e.anchors
-	base0 := slot * e.detStride
+// 输出头遍历统一走 yolohead.Walk，coeffOff 指向本 anchor 掩膜系数的起始偏移。
+func (e *Engine) decodeDetections(v *segView, slot int, conf float32) []cand {
+	nc, nm := e.nc, e.nm
+	detBuf := v.detBuf
 	out := make([]cand, 0, 128)
-	for a := 0; a < anchors; a++ {
-		var cx, cy, w, h float32
-		if e.transposed {
-			base := base0 + a*e.attrs
-			cx = e.detBuf[base]
-			cy = e.detBuf[base+1]
-			w = e.detBuf[base+2]
-			h = e.detBuf[base+3]
-		} else {
-			cx = e.detBuf[base0+a]
-			cy = e.detBuf[base0+anchors+a]
-			w = e.detBuf[base0+2*anchors+a]
-			h = e.detBuf[base0+3*anchors+a]
-		}
-		cls, best := -1, conf
-		for c := 0; c < nc; c++ {
-			var s float32
-			if e.transposed {
-				s = e.detBuf[base0+a*e.attrs+4+c]
-			} else {
-				s = e.detBuf[base0+(4+c)*anchors+a]
-			}
-			if s > best {
-				best, cls = s, c
-			}
-		}
-		if cls < 0 {
-			continue
-		}
-		coeffs := make([]float32, nm)
-		for k := 0; k < nm; k++ {
-			if e.transposed {
-				coeffs[k] = e.detBuf[base0+a*e.attrs+4+nc+k]
-			} else {
-				coeffs[k] = e.detBuf[base0+(4+nc+k)*anchors+a]
-			}
-		}
-		out = append(out, cand{
-			box: engine.Box{
-				ClassID: cls, Confidence: best,
-				X1: cx - w/2, Y1: cy - h/2, X2: cx + w/2, Y2: cy + h/2,
-			},
-			coeffs: coeffs,
+	yolohead.Walk(detBuf, slot, v.detStride, e.anchors, e.attrs, nc, e.transposed, conf,
+		func(_, cls int, cx, cy, w, h, score float32, coeffs []float32) {
+			cf := make([]float32, nm)
+			copy(cf, coeffs)
+			out = append(out, cand{
+				box: engine.Box{
+					ClassID: cls, Confidence: score,
+					X1: cx - w/2, Y1: cy - h/2, X2: cx + w/2, Y2: cy + h/2,
+				},
+				coeffs: cf,
+			})
 		})
+	return out
+}
+
+// nms 对携带掩膜系数的候选做按类 NMS，统一走 postprocess.NMSIndexed
+// （内部用 slices.SortStableFunc 排索引），删除手写插入排序。
+func (e *Engine) nms(cands []cand) []cand {
+	keep := postprocess.NMSIndexed(len(cands),
+		func(i int) float32 { return cands[i].box.Confidence },
+		func(i, j int) bool { return cands[i].box.ClassID == cands[j].box.ClassID },
+		func(i, j int) float32 { return postprocess.IoU(cands[i].box, cands[j].box) },
+		e.cfg.IoUThresh,
+	)
+	out := make([]cand, 0, len(keep))
+	for _, i := range keep {
+		out = append(out, cands[i])
 	}
 	return out
 }
 
-func (e *Engine) nms(cands []cand) []cand {
-	// 候选携带掩膜系数，不能直接用 postprocess.NMS；按置信度降序稳定排序，
-	// 同类 IoU 超阈值则抑制，IoU 复用 postprocess.IoU。
-	for i := 1; i < len(cands); i++ {
-		for j := i; j > 0 && cands[j-1].box.Confidence < cands[j].box.Confidence; j-- {
-			cands[j-1], cands[j] = cands[j], cands[j-1]
-		}
-	}
-	suppressed := make([]bool, len(cands))
-	keep := make([]cand, 0, len(cands))
-	for i := 0; i < len(cands); i++ {
-		if suppressed[i] {
-			continue
-		}
-		keep = append(keep, cands[i])
-		for j := i + 1; j < len(cands); j++ {
-			if suppressed[j] || cands[j].box.ClassID != cands[i].box.ClassID {
-				continue
-			}
-			if postprocess.IoU(cands[i].box, cands[j].box) > e.cfg.IoUThresh {
-				suppressed[j] = true
-			}
-		}
-	}
-	return keep
-}
-
 // makeMasks 对每个保留实例计算二值掩膜、追踪轮廓并映射回原图。
-func (e *Engine) makeMasks(slot int, cands []cand, m *ortbatch.Meta) []engine.Instance {
+//
+// 优化：
+//   - 用 maskLogitThr 直接比较 logit 和，删除逐像素 sigmoid/math.Exp；
+//   - 对框网格预先一次性算出每列/每行的 x0,x1,dx 与 y0,y1,dy（floor/clamp
+//     只做一次），nm 内层循环只做 4 次 protoBuf 取值与乘加；
+//   - 掩膜 mask 与连通域 labels 缓冲从 scratchPool 复用。
+func (e *Engine) makeMasks(v *segView, slot int, cands []cand, m *ortbatch.Meta) []engine.Instance {
 	origW, origH := float32(m.Orig.Dx()), float32(m.Orig.Dy())
 	inW, inH := float32(e.cfg.InputW), float32(e.cfg.InputH)
 	mW, mH := float32(e.maskW), float32(e.maskH)
 	sx, sy := mW/inW, mH/inH
+
+	sc := e.scratchPool.Get().(*maskScratch)
+	defer e.scratchPool.Put(sc)
 
 	instances := make([]engine.Instance, 0, len(cands))
 	for _, c := range cands {
@@ -288,20 +315,93 @@ func (e *Engine) makeMasks(slot int, cands []cand, m *ortbatch.Meta) []engine.In
 		if bw < 2 || bh < 2 {
 			continue
 		}
+		n := bw * bh
+		if n > len(sc.mask) {
+			// 理论上不会超过输入面积；防御性扩容。
+			sc.mask = make([]bool, n)
+			sc.labels = make([]int, n)
+		}
+		mask := sc.mask[:n]
+		labels := sc.labels[:n]
+		for i := range mask {
+			mask[i] = false
+		}
 
-		mask := make([]bool, bw*bh)
+		// 预计算每列 x 网格的 floor/clamp/权重（px 维）。
+		type xg struct {
+			x0, x1 int
+			dx     float32
+		}
+		xs := make([]xg, bw)
+		for px := 0; px < bw; px++ {
+			mx := (float32(px) + 0.5 + ix1) * sx
+			x0 := int(math.Floor(float64(mx)))
+			x1 := x0 + 1
+			if x0 < 0 {
+				x0 = 0
+			}
+			if x0 >= e.maskW {
+				x0 = e.maskW - 1
+			}
+			if x1 >= e.maskW {
+				x1 = e.maskW - 1
+			}
+			xs[px] = xg{x0: x0, x1: x1, dx: mx - float32(x0)}
+		}
+		// 预计算每行 y 网格（py 维）。
+		type yg struct {
+			y0, y1 int
+			dy     float32
+		}
+		ys := make([]yg, bh)
 		for py := 0; py < bh; py++ {
-			my := (float32(py) + 0.5 + iy1) * sy // 掩膜空间 y（像素中心）
+			my := (float32(py) + 0.5 + iy1) * sy
+			y0 := int(math.Floor(float64(my)))
+			y1 := y0 + 1
+			if y0 < 0 {
+				y0 = 0
+			}
+			if y0 >= e.maskH {
+				y0 = e.maskH - 1
+			}
+			if y1 >= e.maskH {
+				y1 = e.maskH - 1
+			}
+			ys[py] = yg{y0: y0, y1: y1, dy: my - float32(y0)}
+		}
+
+		batchOff := slot * v.protoStride
+		plane := e.maskW * e.maskH
+		coeffs := c.coeffs
+		logitThr := e.maskLogitThr
+		for py := 0; py < bh; py++ {
+			yy := ys[py]
+			y0w, y1w := yy.y0*e.maskW, yy.y1*e.maskW
+			dy1 := 1 - yy.dy
+			row := py * bw
 			for px := 0; px < bw; px++ {
-				mx := (float32(px) + 0.5 + ix1) * sx
-				v := e.sampleProto(slot, mx, my, c.coeffs)
-				if v >= e.cfg.MaskThresh {
-					mask[py*bw+px] = true
+				xx := xs[px]
+				dx1 := 1 - xx.dx
+				w00 := dx1 * dy1
+				w10 := xx.dx * dy1
+				w01 := dx1 * yy.dy
+				w11 := xx.dx * yy.dy
+				var sum float32
+				for k := 0; k < e.nm; k++ {
+					base := batchOff + k*plane
+					ck := coeffs[k]
+					sum += ck * (w00*v.protoBuf[base+y0w+xx.x0] +
+						w10*v.protoBuf[base+y0w+xx.x1] +
+						w01*v.protoBuf[base+y1w+xx.x0] +
+						w11*v.protoBuf[base+y1w+xx.x1])
+				}
+				if sum >= logitThr {
+					mask[row+px] = true
 				}
 			}
 		}
 
-		polys := contour(mask, bw, bh)
+		polys := contour(mask, labels, bw, bh)
 		if len(polys) == 0 {
 			continue
 		}
@@ -337,55 +437,6 @@ func (e *Engine) makeMasks(slot int, cands []cand, m *ortbatch.Meta) []engine.In
 		})
 	}
 	return instances
-}
-
-// sampleProto 在第 slot 个原型掩膜上做双线性采样，返回 sigmoid(sum_k coeffs[k]*proto[k])。
-func (e *Engine) sampleProto(slot int, mx, my float32, coeffs []float32) float32 {
-	x0 := int(math.Floor(float64(mx)))
-	y0 := int(math.Floor(float64(my)))
-	x1 := x0 + 1
-	y1 := y0 + 1
-	if x0 < 0 {
-		x0 = 0
-	}
-	if y0 < 0 {
-		y0 = 0
-	}
-	if x0 >= e.maskW {
-		x0 = e.maskW - 1
-	}
-	if y0 >= e.maskH {
-		y0 = e.maskH - 1
-	}
-	if x1 >= e.maskW {
-		x1 = e.maskW - 1
-	}
-	if y1 >= e.maskH {
-		y1 = e.maskH - 1
-	}
-	dx := mx - float32(x0)
-	dy := my - float32(y0)
-	w00 := (1 - dx) * (1 - dy)
-	w10 := dx * (1 - dy)
-	w01 := (1 - dx) * dy
-	w11 := dx * dy
-
-	batchOff := slot * e.protoStride
-	plane := e.maskW * e.maskH
-	var sum float32
-	for k := 0; k < e.nm; k++ {
-		base := batchOff + k*plane
-		p := coeffs[k] * (w00*e.protoBuf[base+y0*e.maskW+x0] +
-			w10*e.protoBuf[base+y0*e.maskW+x1] +
-			w01*e.protoBuf[base+y1*e.maskW+x0] +
-			w11*e.protoBuf[base+y1*e.maskW+x1])
-		sum += p
-	}
-	return sigmoid(sum)
-}
-
-func sigmoid(x float32) float32 {
-	return 1.0 / (1.0 + float32(math.Exp(float64(-x))))
 }
 
 // ---------- 输出形状解析 ----------
