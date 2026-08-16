@@ -21,6 +21,7 @@ import (
 	"github.com/andaoai/go-infer/internal/format/yolo"
 	"github.com/andaoai/go-infer/internal/ortenv"
 	"github.com/andaoai/go-infer/internal/sched"
+	"github.com/andaoai/go-infer/internal/storage"
 	"github.com/andaoai/go-infer/internal/storage/local"
 	ort "github.com/yalue/onnxruntime_go"
 )
@@ -88,7 +89,7 @@ func main() {
 
 	// 推理采集（原图 + YOLO 伪标签），默认关闭。
 	// store/codec 在采集器与采集池浏览器之间共享。
-	var capStore = (*local.Storage)(nil)
+	var capStore storage.Storage
 	if cfg.CaptureDir != "" {
 		st, err := local.New(cfg.CaptureDir)
 		if err != nil {
